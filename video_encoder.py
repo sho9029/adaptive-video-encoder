@@ -33,6 +33,9 @@ CODEC_CONFIGS = {
 AVAILABLE_CODECS = list(CODEC_CONFIGS.keys())
 DEFAULT_CODEC = 'av1_nvenc'
 
+# エンコーダー識別用メタデータ
+ENCODER_TOOL_NAME = 'AdaptiveVideoEncoder'
+
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.wmv', '.m4v', '.mpg', '.mpeg', '.ts', '.m2ts'}
 
 def is_video_file(file_path: Path) -> bool:
@@ -65,6 +68,33 @@ def is_video_file(file_path: Path) -> bool:
         return False
 
     return True
+
+def is_encoded_by_tool(file_path: Path) -> bool:
+    """
+    ファイルがこのツールでエンコード済みかどうかを判定する。
+    メタデータの 'encoder_tool' フィールドを確認する。
+    """
+    cmd = [
+        'ffprobe',
+        '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_format',
+        str(file_path)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        tags = data.get('format', {}).get('tags', {})
+        # MP4ではカスタムタグが 'comment' 等に格納されることが多いため広くチェック
+        # または 'encoder_tool' そのものを直接チェック
+        for key, value in tags.items():
+            if key.lower() == 'encoder_tool' and value == ENCODER_TOOL_NAME:
+                return True
+            if key.lower() == 'comment' and f'tool:{ENCODER_TOOL_NAME}' in value:
+                return True
+        return False
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
 
 def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     """
@@ -170,13 +200,11 @@ def encode_video(
     # プリセット
     cmd.extend(['-preset', preset])
 
-    # 音声設定
-    cmd.extend(['-c:a', audio_codec])
-    if audio_codec != 'copy' and audio_bitrate:
-        cmd.extend(['-b:a', audio_bitrate])
-
-    # メタデータ転送とMP4最適化
+    # メタデータ転送とMP4最適化、エンコーダー識別タグの追加
     cmd.extend(['-map_metadata', '0', '-movflags', '+faststart'])
+    # MP4コンテナの互換性を考慮し、comment タグにも情報を埋め込む
+    cmd.extend(['-metadata', f'encoder_tool={ENCODER_TOOL_NAME}'])
+    cmd.extend(['-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'])
 
     # その他のパラメータ
     for k, v in params.items():
@@ -201,10 +229,15 @@ def process_file(
     source_root: Path,
     target_root: Path,
     args: argparse.Namespace
-):
+) -> bool:
     """
     1つのファイルを処理する。
+    Returns: True if file was processed, False if skipped.
     """
+    # エンコード済みチェック（--force が指定されていない場合）
+    if not args.force and is_encoded_by_tool(source_file):
+        logger.info(f"Skipping already encoded file: {source_file.name}")
+        return False
     # 相対パスを計算してターゲットパスを決定
     rel_path = source_file.relative_to(source_root)
     # コンテナをmp4に変更
@@ -322,6 +355,41 @@ def log_file_size_comparison(source_file: Path, target_file: Path):
     except Exception as e:
         logger.warning(f"Failed to calculate file size comparison: {e}")
 
+def check_encoded_status(target_path: Path):
+    """
+    指定されたパスのエンコード済み状態を確認して表示する。
+    ファイルの場合は単体を、ディレクトリの場合は再帰的に全ファイルを確認する。
+    """
+    if target_path.is_file():
+        files = [target_path]
+    elif target_path.is_dir():
+        files = sorted([p for p in target_path.rglob('*') if p.is_file()])
+    else:
+        logger.error(f"Path not found: {target_path}")
+        return
+    
+    encoded_count = 0
+    not_encoded_count = 0
+    skipped_count = 0
+    
+    for file_path in files:
+        if not is_video_file(file_path):
+            skipped_count += 1
+            continue
+        
+        if is_encoded_by_tool(file_path):
+            status = f"\033[92mEncoded by {ENCODER_TOOL_NAME}\033[0m"  # Green
+            encoded_count += 1
+        else:
+            status = "\033[93mNot encoded\033[0m"  # Yellow
+            not_encoded_count += 1
+        
+        print(f"{file_path}: {status}")
+    
+    # サマリー
+    print(f"\n--- Summary ---")
+    print(f"Encoded: {encoded_count}, Not encoded: {not_encoded_count}, Skipped (non-video): {skipped_count}")
+
 def main():
     if len(sys.argv) == 1:
         # 対話形式での設定
@@ -356,6 +424,9 @@ def main():
         max_retries_str = input(f"最大再試行回数 (デフォルト: {DEFAULT_MAX_RETRIES}): ").strip()
         max_retries = int(max_retries_str) if max_retries_str else DEFAULT_MAX_RETRIES
         
+        force_str = input("既にエンコード済みのファイルも再処理しますか？ (y/N): ").strip().lower()
+        force = force_str in ('y', 'yes')
+        
         args = argparse.Namespace(
             source_dir=Path(source_dir_str),
             target_dir=Path(target_dir_str),
@@ -364,14 +435,18 @@ def main():
             preset=preset,
             min_ssim=min_ssim,
             max_ssim=max_ssim,
-            max_retries=max_retries
+            max_retries=max_retries,
+            force=force
         )
     else:
         # 通常の引数処理
         parser = argparse.ArgumentParser(description='Video Re-encoder with SSIM Quality Assurance')
         
-        parser.add_argument('source_dir', type=Path, help='Source directory containing video files')
-        parser.add_argument('target_dir', type=Path, help='Target directory for output files')
+        parser.add_argument('source_dir', type=Path, nargs='?', help='Source directory containing video files')
+        parser.add_argument('target_dir', type=Path, nargs='?', help='Target directory for output files')
+        
+        parser.add_argument('--check', type=Path, metavar='PATH', help='Check if file(s) are encoded by this tool (no encoding)')
+        parser.add_argument('--force', action='store_true', help='Force re-encode even if already encoded by this tool')
         
         parser.add_argument('--codec', type=str, default=DEFAULT_CODEC, 
                             choices=AVAILABLE_CODECS,
@@ -386,6 +461,15 @@ def main():
         parser.add_argument('--max-retries', type=int, default=DEFAULT_MAX_RETRIES, help=f'Maximum retries for quality adjustment (default: {DEFAULT_MAX_RETRIES})')
 
         args = parser.parse_args()
+        
+        # --check モードの処理
+        if args.check:
+            check_encoded_status(args.check)
+            return
+        
+        # source_dir と target_dir の必須チェック
+        if not args.source_dir or not args.target_dir:
+            parser.error('source_dir and target_dir are required unless using --check')
 
     # デフォルト値の設定（共通ロジック）
     # コーデックごとのデフォルト設定を取得
