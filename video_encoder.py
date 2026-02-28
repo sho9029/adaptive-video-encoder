@@ -313,8 +313,20 @@ def process_file(
         ssim = calculate_ssim(source_file, target_file)
         logger.info(f"SSIM for {source_file.name}: {ssim}")
 
+        # サイズチェック（早期終了の判断材料）
+        try:
+            src_size = source_file.stat().st_size
+            tgt_size = target_file.stat().st_size
+        except Exception:
+            src_size = tgt_size = 0
+
         if ssim < args.min_ssim:
             if attempt < args.max_retries:
+                # すでにサイズが元を超えている場合、品質を上げるとさらにサイズが増えるため早期終了
+                if tgt_size > src_size and src_size > 0:
+                    logger.warning(f"Quality check failed (SSIM: {ssim} < {args.min_ssim}) and size already exceeds original ({tgt_size} > {src_size}). Stopping quality adjustment.")
+                    break
+                
                 logger.info(f"Quality check (SSIM: {ssim} < {args.min_ssim}). Retrying with higher quality...")
                 # 画質を上げる（値を下げる）
                 current_quality -= 2
@@ -322,7 +334,6 @@ def process_file(
                     current_quality = 0
             else:
                 logger.warning(f"Quality check failed after {args.max_retries} retries. Keeping the best attempt.")
-                log_file_size_comparison(source_file, target_file)
                 break
         elif ssim > args.max_ssim:
             if attempt < args.max_retries:
@@ -331,12 +342,32 @@ def process_file(
                 current_quality += 2
             else:
                 logger.warning(f"Quality check: SSIM still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.")
-                log_file_size_comparison(source_file, target_file)
                 break
         else:
             logger.info(f"Quality check passed (SSIM: {ssim} is within [{args.min_ssim}, {args.max_ssim}]).")
-            log_file_size_comparison(source_file, target_file)
             break
+
+    # ファイルサイズの最終チェック
+    try:
+        src_size = source_file.stat().st_size
+        tgt_size = target_file.stat().st_size
+        
+        if tgt_size > src_size:
+            logger.warning(f"Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
+            # エンコードしたファイルを削除
+            if target_file.exists():
+                target_file.unlink()
+            # 元の拡張子でコピー
+            final_target = target_root / rel_path
+            final_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, final_target)
+            logger.info(f"Reverted to original file: {final_target.name}")
+        else:
+            log_file_size_comparison(source_file, target_file)
+    except Exception as e:
+        logger.error(f"Error during final size check/fallback: {e}")
+
+    return True
 
 def log_file_size_comparison(source_file: Path, target_file: Path):
     """
