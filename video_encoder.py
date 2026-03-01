@@ -241,6 +241,206 @@ def encode_video(
             logger.error(f"  {e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr}")
         return False
 
+def determine_audio_settings(source_info: dict) -> tuple[str, Optional[str]]:
+    """
+    動画情報から適切な音声コーデックとビットレートを決定する。
+    Returns: (audio_codec, audio_bitrate)
+    """
+    audio_codec = 'aac'
+    audio_bitrate = '192k'
+    
+    audio_streams = [s for s in source_info.get('streams', []) if s.get('codec_type') == 'audio']
+    if audio_streams:
+        src_audio = audio_streams[0]
+        if src_audio.get('codec_name') == 'aac':
+            audio_codec = 'copy'
+            audio_bitrate = None
+        else:
+            # ビットレート取得
+            br = src_audio.get('bit_rate')
+            if br:
+                audio_bitrate = str(br)
+            # ビットレートが取得できない場合はデフォルト設定(192k)を使用
+
+    return audio_codec, audio_bitrate
+
+def run_encode_with_retry(
+    source_file: Path,
+    encode_target_file: Path,
+    source_info: dict,
+    audio_codec: str,
+    audio_bitrate: Optional[str],
+    args: argparse.Namespace,
+    summary_data: list,
+    in_place: bool
+) -> tuple[bool, int]:
+    """
+    エンコードの実行とSSIM検証による再試行ループを管理する。
+    Returns: (success_bool, final_attempt_count)
+    """
+    current_quality = args.quality
+    
+    for attempt in range(args.max_retries + 1):
+        success = encode_video(
+            source_file,
+            encode_target_file,
+            args.codec,
+            current_quality,
+            args.preset,
+            audio_codec,
+            audio_bitrate
+        )
+
+        if not success:
+            logger.error(f"  Failed to encode. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Encode)'
+            })
+            return False, attempt
+
+        # 解像度チェック
+        target_info = get_video_info(encode_target_file)
+        if not target_info:
+            logger.error(f"  Failed to get info for encoded file. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Target Probe)'
+            })
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
+            return False, attempt
+
+        # 映像ストリームを探す
+        src_video_streams = [s for s in source_info['streams'] if s.get('codec_type') == 'video']
+        tgt_video_streams = [s for s in target_info['streams'] if s.get('codec_type') == 'video']
+        
+        if not src_video_streams or not tgt_video_streams:
+            logger.error(f"  Video stream not found for comparison. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (No Stream)'
+            })
+            return False, attempt
+
+        src_stream = src_video_streams[0]
+        tgt_stream = tgt_video_streams[0]
+        
+        if src_stream.get('width') != tgt_stream.get('width') or \
+           src_stream.get('height') != tgt_stream.get('height'):
+            logger.error(f"  Resolution mismatch: "
+                         f"{src_stream.get('width')}x{src_stream.get('height')} -> "
+                         f"{tgt_stream.get('width')}x{tgt_stream.get('height')}")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Resolution)'
+            })
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
+            return False, attempt
+
+        # SSIMチェック
+        ssim = calculate_ssim(source_file, encode_target_file)
+
+        # サイズチェック（早期終了の判断材料）
+        try:
+            src_size = source_file.stat().st_size
+            tgt_size = encode_target_file.stat().st_size
+        except Exception:
+            src_size = tgt_size = 0
+
+        if ssim < args.min_ssim:
+            if attempt < args.max_retries:
+                if tgt_size > src_size and src_size > 0:
+                    logger.warning(f"  SSIM: {ssim} (Failed, size already exceeds original. Stopping adjustment.)")
+                    break
+                logger.info(f"  SSIM: {ssim} (Failed, Retrying with Q: {current_quality - 2}...)")
+                current_quality = max(0, current_quality - 2)
+            else:
+                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Keeping the best attempt.)")
+                break
+        elif ssim > args.max_ssim:
+            if attempt < args.max_retries:
+                logger.info(f"  SSIM: {ssim} (Exceeds {args.max_ssim}, Retrying with Q: {current_quality + 2}...)")
+                current_quality += 2
+            else:
+                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.)")
+                break
+        else:
+            logger.info(f"  SSIM: {ssim} (Passed)")
+            break
+
+    return True, attempt
+
+def finalize_encoded_file(
+    source_file: Path,
+    encode_target_file: Path,
+    target_file: Path,
+    target_root: Path,
+    rel_path: Path,
+    attempt: int,
+    in_place: bool,
+    summary_data: list
+) -> None:
+    """
+    エンコード後のファイルサイズチェック、およびIn-Place時のリネーム/クリーンアップ処理を行う。
+    """
+    final_status = f"Success (Retry {attempt})" if attempt > 0 else "Success"
+    src_size = 0
+    tgt_size = 0
+    
+    try:
+        src_size = source_file.stat().st_size
+        tgt_size = encode_target_file.stat().st_size
+        
+        if tgt_size > src_size:
+            logger.warning(f"  Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
+            if encode_target_file.exists():
+                encode_target_file.unlink()
+            
+            if not in_place:
+                final_target = target_root / rel_path
+                final_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_file, final_target)
+            
+            logger.info(f"  Reverted to original file")
+            tgt_size = src_size # 元のサイズに戻ったため
+            final_status = "Reverted (Size)"
+        else:
+            log_file_size_comparison(src_size, tgt_size)
+            if in_place:
+                try:
+                    import send2trash
+                    send2trash.send2trash(str(source_file.resolve()))
+                except ImportError:
+                    source_file.unlink()
+                except Exception as e:
+                    logger.warning(f"  Failed to move original to trash, deleting directly: {e}")
+                    source_file.unlink()
+                
+                encode_target_file.rename(target_file)
+                
+    except Exception as e:
+        logger.error(f"  Error during final size check/fallback: {e}")
+        final_status = "Failed (Size Check)"
+        if in_place and encode_target_file.exists():
+            encode_target_file.unlink()
+
+    summary_data.append({
+        'name': source_file.name,
+        'original_size': src_size,
+        'encoded_size': tgt_size,
+        'status': final_status
+    })
+
 def process_file(
     source_file: Path,
     source_root: Path,
@@ -286,183 +486,22 @@ def process_file(
         return False
 
     # 音声設定の決定
-    audio_codec = 'aac'
-    audio_bitrate = '192k'
+    audio_codec, audio_bitrate = determine_audio_settings(source_info)
+
+    # エンコードとSSIM検証ループの実行
+    success, attempt = run_encode_with_retry(
+        source_file, encode_target_file, source_info, 
+        audio_codec, audio_bitrate, args, summary_data, in_place
+    )
     
-    audio_streams = [s for s in source_info.get('streams', []) if s.get('codec_type') == 'audio']
-    if audio_streams:
-        src_audio = audio_streams[0]
-        if src_audio.get('codec_name') == 'aac':
-            audio_codec = 'copy'
-            audio_bitrate = None
-        else:
-            # ビットレート取得
-            br = src_audio.get('bit_rate')
-            if br:
-                audio_bitrate = str(br)
-            # ビットレートが取得できない場合はデフォルト設定を使用
+    if not success:
+        return False
 
-    # エンコードパラメータの初期化
-    current_quality = args.quality
-    
-    # 再試行ループ
-    for attempt in range(args.max_retries + 1):
-        success = encode_video(
-            source_file,
-            encode_target_file,
-            args.codec,
-            current_quality,
-            args.preset,
-            audio_codec,
-            audio_bitrate
-        )
-
-        if not success:
-            logger.error(f"  Failed to encode. Skipping.")
-            summary_data.append({
-                'name': source_file.name,
-                'original_size': source_file.stat().st_size,
-                'encoded_size': None,
-                'status': 'Failed (Encode)'
-            })
-            return False
-
-        # 解像度チェック
-        target_info = get_video_info(encode_target_file)
-        if not target_info:
-            logger.error(f"  Failed to get info for encoded file. Skipping.")
-            summary_data.append({
-                'name': source_file.name,
-                'original_size': source_file.stat().st_size,
-                'encoded_size': None,
-                'status': 'Failed (Target Probe)'
-            })
-            # 失敗時は一時ファイルを削除
-            if in_place and encode_target_file.exists():
-                encode_target_file.unlink()
-            return False
-
-        # 映像ストリームを探す
-        src_video_streams = [s for s in source_info['streams'] if s.get('codec_type') == 'video']
-        tgt_video_streams = [s for s in target_info['streams'] if s.get('codec_type') == 'video']
-        
-        if not src_video_streams or not tgt_video_streams:
-            logger.error(f"  Video stream not found for comparison. Skipping.")
-            summary_data.append({
-                'name': source_file.name,
-                'original_size': source_file.stat().st_size,
-                'encoded_size': None,
-                'status': 'Failed (No Stream)'
-            })
-            return False
-
-        src_stream = src_video_streams[0]
-        tgt_stream = tgt_video_streams[0]
-        
-        if src_stream.get('width') != tgt_stream.get('width') or \
-           src_stream.get('height') != tgt_stream.get('height'):
-            logger.error(f"  Resolution mismatch: "
-                         f"{src_stream.get('width')}x{src_stream.get('height')} -> "
-                         f"{tgt_stream.get('width')}x{tgt_stream.get('height')}")
-            summary_data.append({
-                'name': source_file.name,
-                'original_size': source_file.stat().st_size,
-                'encoded_size': None,
-                'status': 'Failed (Resolution)'
-            })
-            # 失敗時は一時ファイルを削除
-            if in_place and encode_target_file.exists():
-                encode_target_file.unlink()
-            return False
-
-        # SSIMチェック
-        ssim = calculate_ssim(source_file, encode_target_file)
-
-        # サイズチェック（早期終了の判断材料）
-        try:
-            src_size = source_file.stat().st_size
-            tgt_size = encode_target_file.stat().st_size
-        except Exception:
-            src_size = tgt_size = 0
-
-        if ssim < args.min_ssim:
-            if attempt < args.max_retries:
-                # すでにサイズが元を超えている場合、品質を上げるとさらにサイズが増えるため早期終了
-                if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  SSIM: {ssim} (Failed, size already exceeds original. Stopping adjustment.)")
-                    break
-                
-                logger.info(f"  SSIM: {ssim} (Failed, Retrying with Q: {current_quality - 2}...)")
-                # 画質を上げる（値を下げる）
-                current_quality -= 2
-                if current_quality < 0:
-                    current_quality = 0
-            else:
-                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Keeping the best attempt.)")
-                break
-        elif ssim > args.max_ssim:
-            if attempt < args.max_retries:
-                logger.info(f"  SSIM: {ssim} (Exceeds {args.max_ssim}, Retrying with Q: {current_quality + 2}...)")
-                # 画質を下げる（値を上げる）
-                current_quality += 2
-            else:
-                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.)")
-                break
-        else:
-            logger.info(f"  SSIM: {ssim} (Passed)")
-            break
-
-    # ファイルサイズの最終チェック
-    final_status = f"Success (Retry {attempt})" if attempt > 0 else "Success"
-    try:
-        src_size = source_file.stat().st_size
-        tgt_size = encode_target_file.stat().st_size
-        
-        if tgt_size > src_size:
-            logger.warning(f"  Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
-            # エンコードしたファイル（一時ファイルまたは新規出力ファイル）を削除
-            if encode_target_file.exists():
-                encode_target_file.unlink()
-            
-            # in-place でない場合は、元のファイルを target_root にコピーして「差し戻し」を再現
-            if not in_place:
-                final_target = target_root / rel_path
-                final_target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_file, final_target)
-            
-            logger.info(f"  Reverted to original file")
-            tgt_size = src_size # 元のサイズに戻ったため
-            final_status = "Reverted (Size)"
-        else:
-            log_file_size_comparison(src_size, tgt_size)
-            # サイズが小さくなり、上書き(in-place)の場合は、元のファイルを消して一時ファイルをリネーム
-            if in_place:
-                # send2trashがインストールされていれば使う（トップレベルでimportしないための設計）
-                try:
-                    # 可能ならゴミ箱へ、無理なら削除
-                    import send2trash
-                    send2trash.send2trash(str(source_file.resolve()))
-                except ImportError:
-                    source_file.unlink()
-                except Exception as e:
-                    logger.warning(f"  Failed to move original to trash, deleting directly: {e}")
-                    source_file.unlink()
-                
-                encode_target_file.rename(target_file)
-                
-    except Exception as e:
-        logger.error(f"  Error during final size check/fallback: {e}")
-        final_status = "Failed (Size Check)"
-        # エラー発生時、in-placeの一時ファイルが残っていれば削除
-        if in_place and encode_target_file.exists():
-            encode_target_file.unlink()
-
-    summary_data.append({
-        'name': source_file.name,
-        'original_size': src_size,
-        'encoded_size': tgt_size,
-        'status': final_status
-    })
+    # ファイルサイズの最終チェックと差し替え・クリーンアップ処理
+    finalize_encoded_file(
+        source_file, encode_target_file, target_file, target_root, rel_path,
+        attempt, in_place, summary_data
+    )
 
     return True
 
@@ -516,7 +555,10 @@ def check_encoded_status(target_path: Path):
     print(f"\n--- Summary ---")
     print(f"Encoded: {encoded_count}, Not encoded: {not_encoded_count}, Skipped (non-video): {skipped_count}")
 
-def main():
+def parse_arguments() -> argparse.Namespace:
+    """
+    コマンドライン引数を解析し、対話モードと引数モードの両方に対応する。
+    """
     if len(sys.argv) == 1:
         # 対話形式での設定
         while True:
@@ -562,7 +604,8 @@ def main():
             min_ssim=min_ssim,
             max_ssim=max_ssim,
             max_retries=max_retries,
-            force=force
+            force=force,
+            check=None
         )
     else:
         # 通常の引数処理
@@ -588,14 +631,19 @@ def main():
 
         args = parser.parse_args()
         
-        # --check モードの処理
-        if args.check:
-            check_encoded_status(args.check)
-            return
-        
         # source_dir と target_dir の必須チェック
-        if not args.source_dir or not args.target_dir:
+        if not args.check and (not args.source_dir or not args.target_dir):
             parser.error('source_dir and target_dir are required unless using --check')
+
+    return args
+
+def main():
+    args = parse_arguments()
+    
+    # --check モードの処理
+    if args.check:
+        check_encoded_status(args.check)
+        return
 
     # デフォルト値の設定（共通ロジック）
     # コーデックごとのデフォルト設定を取得
@@ -669,56 +717,64 @@ def main():
                 shutil.copy2(file_path, target_file)
 
     # 結果サマリーの表示
-    if summary_data:
-        total_files = len(summary_data)
-        success_files = sum(1 for item in summary_data if item['status'].startswith('Success'))
-        skipped_files = sum(1 for item in summary_data if item['status'] == 'Skipped')
-        failed_files = sum(1 for item in summary_data if item['status'].startswith('Failed'))
-        
-        total_original_size = sum(item['original_size'] for item in summary_data if item['original_size'] is not None)
-        total_encoded_size = sum(item['encoded_size'] for item in summary_data if item['encoded_size'] is not None and item['status'].startswith('Success'))
-        
-        # エンコードされなかったファイルはそのままのサイズとして足す
-        for item in summary_data:
-            if not item['status'].startswith('Success') and item['original_size'] is not None:
-                total_encoded_size += item['original_size']
+    print_summary_table(summary_data)
 
-        total_ratio = (total_encoded_size / total_original_size) * 100 if total_original_size > 0 else 0
+def print_summary_table(summary_data: list) -> None:
+    """
+    エンコード処理完了後に結果のサマリー表を出力する。
+    """
+    if not summary_data:
+        return
+        
+    total_files = len(summary_data)
+    success_files = sum(1 for item in summary_data if item['status'].startswith('Success'))
+    skipped_files = sum(1 for item in summary_data if item['status'] == 'Skipped')
+    failed_files = sum(1 for item in summary_data if item['status'].startswith('Failed'))
+    
+    total_original_size = sum(item['original_size'] for item in summary_data if item['original_size'] is not None)
+    total_encoded_size = sum(item['encoded_size'] for item in summary_data if item['encoded_size'] is not None and item['status'].startswith('Success'))
+    
+    # エンコードされなかったファイルはそのままのサイズとして足す
+    for item in summary_data:
+        if not item['status'].startswith('Success') and item['original_size'] is not None:
+            total_encoded_size += item['original_size']
 
-        print(f"\n================================================================================")
-        print(f"Encoding Summary")
-        print(f"================================================================================")
-        print(f" Total Files Processed : {total_files}")
-        print(f" Successfully Encoded  : {success_files}")
-        print(f" Skipped / Copied      : {skipped_files + sum(1 for i in summary_data if 'Copied' in i['status'])}")
-        print(f" Failed                : {failed_files}")
-        print(f"\n--------------------------------------------------------------------------------")
-        print(f" {'File Name':<30} | {'Original Size':>13} | {'Encoded Size':>12} | {'Ratio':>5} | {'Status'}")
-        print(f"--------------------------------------------------------------------------------")
+    total_ratio = (total_encoded_size / total_original_size) * 100 if total_original_size > 0 else 0
+
+    print(f"\n================================================================================")
+    print(f"Encoding Summary")
+    print(f"================================================================================")
+    print(f" Total Files Processed : {total_files}")
+    print(f" Successfully Encoded  : {success_files}")
+    print(f" Skipped / Copied      : {skipped_files + sum(1 for i in summary_data if 'Copied' in i['status'])}")
+    print(f" Failed                : {failed_files}")
+    print(f"\n--------------------------------------------------------------------------------")
+    print(f" {'File Name':<30} | {'Original Size':>13} | {'Encoded Size':>12} | {'Ratio':>5} | {'Status'}")
+    print(f"--------------------------------------------------------------------------------")
+    
+    for item in summary_data:
+        orig_str = f"{item['original_size'] / (1024*1024):10.2f} MB" if item['original_size'] is not None else "---"
         
-        for item in summary_data:
-            orig_str = f"{item['original_size'] / (1024*1024):10.2f} MB" if item['original_size'] is not None else "---"
+        if item['encoded_size'] is not None and item['status'].startswith('Success'):
+            enc_str = f"{item['encoded_size'] / (1024*1024):9.2f} MB"
+            ratio = (item['encoded_size'] / item['original_size']) * 100 if item['original_size'] else 0
+            ratio_str = f"{ratio:4.1f}%"
+        else:
+            enc_str = "        ---  "
+            ratio_str = " --- "
             
-            if item['encoded_size'] is not None and item['status'].startswith('Success'):
-                enc_str = f"{item['encoded_size'] / (1024*1024):9.2f} MB"
-                ratio = (item['encoded_size'] / item['original_size']) * 100 if item['original_size'] else 0
-                ratio_str = f"{ratio:4.1f}%"
-            else:
-                enc_str = "        ---  "
-                ratio_str = " --- "
-                
-            name_str = item['name']
-            if len(name_str) > 30:
-                name_str = name_str[:27] + "..."
-            
-            print(f" {name_str:<30} | {orig_str:>13} | {enc_str:>12} | {ratio_str:>5} | {item['status']}")
-            
-        print(f"--------------------------------------------------------------------------------")
-        orig_total_str = f"{total_original_size / (1024*1024):10.2f} MB"
-        enc_total_str = f"{total_encoded_size / (1024*1024):9.2f} MB"
+        name_str = item['name']
+        if len(name_str) > 30:
+            name_str = name_str[:27] + "..."
         
-        print(f" {'Total Size':<30} | {orig_total_str:>13} | {enc_total_str:>12} | {total_ratio:4.1f}% |")
-        print(f"================================================================================\n")
+        print(f" {name_str:<30} | {orig_str:>13} | {enc_str:>12} | {ratio_str:>5} | {item['status']}")
+        
+    print(f"--------------------------------------------------------------------------------")
+    orig_total_str = f"{total_original_size / (1024*1024):10.2f} MB"
+    enc_total_str = f"{total_encoded_size / (1024*1024):9.2f} MB"
+    
+    print(f" {'Total Size':<30} | {orig_total_str:>13} | {enc_total_str:>12} | {total_ratio:4.1f}% |")
+    print(f"================================================================================\n")
 
 if __name__ == '__main__':
     main()
