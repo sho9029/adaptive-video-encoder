@@ -361,18 +361,37 @@ def run_encode_with_retry(
             if attempt < args.max_retries:
                 if tgt_size > src_size and src_size > 0:
                     logger.warning(f"  SSIM: {ssim} (Failed, size already exceeds original. Stopping adjustment.)")
-                    break
+                    # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
+                    summary_data.append({
+                        'name': source_file.name,
+                        'original_size': src_size,
+                        'encoded_size': None,
+                        'status': f'Failed (SSIM {ssim:.3f} < {args.min_ssim})'
+                    })
+                    if encode_target_file.exists():
+                        encode_target_file.unlink()
+                    return False, attempt
+                
                 logger.info(f"  SSIM: {ssim} (Failed, Retrying with Q: {current_quality - 2}...)")
                 current_quality = max(0, current_quality - 2)
             else:
-                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Keeping the best attempt.)")
-                break
+                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Target minimum SSIM not reached.)")
+                summary_data.append({
+                    'name': source_file.name,
+                    'original_size': src_size,
+                    'encoded_size': None,
+                    'status': f'Failed (SSIM Limit)'
+                })
+                # 目標画質に達しなかったので結果を破棄（一時ファイルを削除）
+                if encode_target_file.exists():
+                    encode_target_file.unlink()
+                return False, attempt
         elif ssim > args.max_ssim:
             if attempt < args.max_retries:
                 logger.info(f"  SSIM: {ssim} (Exceeds {args.max_ssim}, Retrying with Q: {current_quality + 2}...)")
                 current_quality += 2
             else:
-                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.)")
+                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping this attempt as success.)")
                 break
         else:
             logger.info(f"  SSIM: {ssim} (Passed)")
