@@ -279,6 +279,7 @@ def run_encode_with_retry(
     Returns: (success_bool, final_attempt_count)
     """
     current_quality = args.quality
+    history = []  # (quality_used, ssim_result) の履歴リスト
     
     for attempt in range(args.max_retries + 1):
         success = encode_video(
@@ -349,6 +350,7 @@ def run_encode_with_retry(
 
         # SSIMチェック
         ssim = calculate_ssim(source_file, encode_target_file)
+        history.append((current_quality, ssim))
 
         # サイズチェック（早期終了の判断材料）
         try:
@@ -360,7 +362,7 @@ def run_encode_with_retry(
         if ssim < args.min_ssim:
             if attempt < args.max_retries:
                 if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  SSIM: {ssim} (Failed, size already exceeds original. Stopping adjustment.)")
+                    logger.warning(f"  SSIM: {ssim:.5f} (Failed, size already exceeds original. Stopping adjustment.)")
                     # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
                     summary_data.append({
                         'name': source_file.name,
@@ -372,10 +374,33 @@ def run_encode_with_retry(
                         encode_target_file.unlink()
                     return False, attempt
                 
-                logger.info(f"  SSIM: {ssim} (Failed, Retrying with Q: {current_quality - 2}...)")
-                current_quality = max(0, current_quality - 2)
+                # --- 非線形画質調整 (Secant / P制御) ---
+                target_ssim = args.min_ssim + 0.002
+                if len(history) >= 2:
+                    q1, s1 = history[-2]
+                    q2, s2 = history[-1]
+                    if s2 == s1: # SSIMが全く変化しなかった場合の保護
+                        delta_q = -1.0
+                    else:
+                        slope = (q2 - q1) / (s2 - s1)
+                        delta_q = slope * (target_ssim - s2)
+                else:
+                    # 履歴が1つしかない場合はP制御（K = 200）で推測
+                    delta_q = -200.0 * (target_ssim - ssim)
+                
+                # 極端な変動を防ぐためのクリッピング（±6）
+                delta_q = max(-6.0, min(6.0, delta_q))
+                next_q = round(current_quality + delta_q)
+                
+                # 最低でも1ステップは動かす
+                if next_q == current_quality:
+                    next_q -= 1
+                
+                next_q = max(0, next_q) # 負のQ値は避ける
+                logger.info(f"  SSIM: {ssim:.5f} (Failed, Adjusting Q: {current_quality} -> {next_q}...)")
+                current_quality = next_q
             else:
-                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Target minimum SSIM not reached.)")
+                logger.warning(f"  SSIM: {ssim:.5f} (Failed after {args.max_retries} retries. Target minimum SSIM not reached.)")
                 summary_data.append({
                     'name': source_file.name,
                     'original_size': src_size,
@@ -388,13 +413,32 @@ def run_encode_with_retry(
                 return False, attempt
         elif ssim > args.max_ssim:
             if attempt < args.max_retries:
-                logger.info(f"  SSIM: {ssim} (Exceeds {args.max_ssim}, Retrying with Q: {current_quality + 2}...)")
-                current_quality += 2
+                # --- 非線形画質調整 (Secant / P制御) ---
+                target_ssim = args.max_ssim - 0.002
+                if len(history) >= 2:
+                    q1, s1 = history[-2]
+                    q2, s2 = history[-1]
+                    if s2 == s1:
+                        delta_q = 1.0
+                    else:
+                        slope = (q2 - q1) / (s2 - s1)
+                        delta_q = slope * (target_ssim - s2)
+                else:
+                    delta_q = -200.0 * (target_ssim - ssim)
+                
+                delta_q = max(-6.0, min(6.0, delta_q))
+                next_q = round(current_quality + delta_q)
+                
+                if next_q == current_quality:
+                    next_q += 1
+                
+                logger.info(f"  SSIM: {ssim:.5f} (Exceeds {args.max_ssim}, Adjusting Q: {current_quality} -> {next_q}...)")
+                current_quality = next_q
             else:
-                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping this attempt as success.)")
+                logger.warning(f"  SSIM: {ssim:.5f} (Still exceeds upper limit after {args.max_retries} retries. Keeping this attempt as success.)")
                 break
         else:
-            logger.info(f"  SSIM: {ssim} (Passed)")
+            logger.info(f"  SSIM: {ssim:.5f} (Passed)")
             break
 
     return True, attempt
