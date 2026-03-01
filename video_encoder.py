@@ -7,30 +7,29 @@ import shutil
 import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from tqdm import tqdm
 
-# ロギング設定
-# プログレスバー（tqdm）と標準出力が混ざらないように、カスタムのTqdmLoggingHandlerを定義する
-class TqdmLoggingHandler(logging.Handler):
-    def __init__(self, level=logging.NOTSET):
-        super().__init__(level)
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn
+)
+from rich.table import Table
 
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            tqdm.write(msg)
-            self.flush()
-        except Exception:
-            self.handleError(record)
+# --- rich Console の初期化 ---
+console = Console()
 
-# フォーマットを [HH:MM:SS] [LEVEL] メッセージ という形にスッキリさせる
-formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
-handler = TqdmLoggingHandler()
-handler.setFormatter(formatter)
-
+# --- ロギング設定 ---
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[handler]
+    format="%(message)s",
+    datefmt="[%H:%M:%S]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False, markup=True, highlighter=None)]
 )
 logger = logging.getLogger(__name__)
 
@@ -231,7 +230,7 @@ def encode_video(
     cmd.append(str(output_path))
 
     try:
-        logger.info(f"  Encoding... (Codec: {codec}, Q: {quality_value}, Audio: {audio_codec}/{audio_bitrate})")
+        logger.info(f"  Encoding... (Codec: [cyan]{codec}[/cyan], Q: [cyan]{quality_value}[/cyan], Audio: [cyan]{audio_codec}/{audio_bitrate}[/cyan])")
         subprocess.run(cmd, check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError as e:
@@ -362,7 +361,7 @@ def run_encode_with_retry(
         if ssim < args.min_ssim:
             if attempt < args.max_retries:
                 if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  SSIM: {ssim:.5f} (Failed, size already exceeds original. Stopping adjustment.)")
+                    logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red], size already exceeds original. Stopping adjustment.)")
                     # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
                     summary_data.append({
                         'name': source_file.name,
@@ -397,10 +396,10 @@ def run_encode_with_retry(
                     next_q -= 1
                 
                 next_q = max(0, next_q) # 負のQ値は避ける
-                logger.info(f"  SSIM: {ssim:.5f} (Failed, Adjusting Q: {current_quality} -> {next_q}...)")
+                logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
                 current_quality = next_q
             else:
-                logger.warning(f"  SSIM: {ssim:.5f} (Failed after {args.max_retries} retries. Target minimum SSIM not reached.)")
+                logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red] after {args.max_retries} retries. Target minimum SSIM not reached.)")
                 summary_data.append({
                     'name': source_file.name,
                     'original_size': src_size,
@@ -432,13 +431,13 @@ def run_encode_with_retry(
                 if next_q == current_quality:
                     next_q += 1
                 
-                logger.info(f"  SSIM: {ssim:.5f} (Exceeds {args.max_ssim}, Adjusting Q: {current_quality} -> {next_q}...)")
+                logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([yellow]Exceeds {args.max_ssim}[/yellow], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
                 current_quality = next_q
             else:
-                logger.warning(f"  SSIM: {ssim:.5f} (Still exceeds upper limit after {args.max_retries} retries. Keeping this attempt as success.)")
+                logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([yellow]Still exceeds upper limit[/yellow] after {args.max_retries} retries. Keeping this attempt as success.)")
                 break
         else:
-            logger.info(f"  SSIM: {ssim:.5f} (Passed)")
+            logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([green]Passed[/green])")
             break
 
     return True, attempt
@@ -465,7 +464,7 @@ def finalize_encoded_file(
         tgt_size = encode_target_file.stat().st_size
         
         if tgt_size > src_size:
-            logger.warning(f"  Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
+            logger.warning(f"  [yellow]Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
             if encode_target_file.exists():
                 encode_target_file.unlink()
             
@@ -474,7 +473,7 @@ def finalize_encoded_file(
                 final_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_file, final_target)
             
-            logger.info(f"  Reverted to original file")
+            logger.info(f"  [yellow]Reverted to original file[/yellow]")
             tgt_size = src_size # 元のサイズに戻ったため
             final_status = "Reverted (Size)"
         else:
@@ -579,9 +578,9 @@ def log_file_size_comparison(src_size: int, tgt_size: int):
         src_mb = src_size / (1024 * 1024)
         tgt_mb = tgt_size / (1024 * 1024)
         
-        logger.info(f"  Size: {src_mb:.2f}MB -> {tgt_mb:.2f}MB (Compressed: {ratio_percent:.1f}%)")
+        logger.info(f"  Size: [cyan]{src_mb:.2f}MB[/cyan] -> [cyan]{tgt_mb:.2f}MB[/cyan] ([green]Compressed: {ratio_percent:.1f}%[/green])")
     except Exception as e:
-        logger.warning(f"  Failed to calculate file size comparison: {e}")
+        logger.warning(f"  [red]Failed to calculate file size comparison: {e}[/red]")
 
 def check_encoded_status(target_path: Path):
     """
@@ -744,40 +743,58 @@ def main():
 
     summary_data = []
 
-    for i, file_path in enumerate(tqdm(all_files, desc="Processing Videos", dynamic_ncols=True, leave=True)):
-        # 隠しファイル除外
-        if file_path.name.startswith('.'):
-            continue
+    # --- rich.progress を使用した処理ループ ---
+    progress_ui = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        "•",
+        TimeElapsedColumn(),
+        "•",
+        TimeRemainingColumn(),
+        console=console,
+        transient=False
+    )
+    
+    with progress_ui as progress:
+        task_id = progress.add_task("[cyan]Processing Files...", total=len(all_files))
+        
+        for i, file_path in enumerate(all_files):
+            progress.update(task_id, description=f"[cyan]Processing: [bold]{file_path.name}[/bold]")
+            
+            if file_path.name.startswith('.'):
+                progress.advance(task_id)
+                continue
 
-        if is_video_file(file_path):
-            logger.info(f"Processing [{i+1}/{len(all_files)}]: {file_path.name}")
-            process_file(file_path, args.source_dir, args.target_dir, args, summary_data)
-        else:
-            # 動画でない場合はそのままコピー
-            rel_path = file_path.relative_to(args.source_dir)
-            target_file = args.target_dir / rel_path
-            
-            # 出力先ディレクトリの準備
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Processing [{i+1}/{len(all_files)}]: {file_path.name} (Non-video)")
-            
-            # 自身へのコピーを防ぐ
-            if file_path.resolve() == target_file.resolve():
-                summary_data.append({
-                    'name': file_path.name,
-                    'original_size': file_path.stat().st_size,
-                    'encoded_size': None,
-                    'status': 'Skipped (In-place non-video)'
-                })
+            if is_video_file(file_path):
+                # logger.info を使って Progress と連携した出力を行う
+                logger.info(f"Processing \\[[yellow]{i+1}/{len(all_files)}[/yellow]]: [cyan]{file_path.name}[/cyan]")
+                process_file(file_path, args.source_dir, args.target_dir, args, summary_data)
             else:
-                summary_data.append({
-                    'name': file_path.name,
-                    'original_size': file_path.stat().st_size,
-                    'encoded_size': None,
-                    'status': 'Copied (Non-video)'
-                })
-                shutil.copy2(file_path, target_file)
+                rel_path = file_path.relative_to(args.source_dir)
+                target_file = args.target_dir / rel_path
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                logger.info(f"Processing \\[[yellow]{i+1}/{len(all_files)}[/yellow]]: [cyan]{file_path.name}[/cyan] (Non-video)")
+                
+                if file_path.resolve() == target_file.resolve():
+                    summary_data.append({
+                        'name': file_path.name,
+                        'original_size': file_path.stat().st_size,
+                        'encoded_size': None,
+                        'status': 'Skipped (In-place non-video)'
+                    })
+                else:
+                    summary_data.append({
+                        'name': file_path.name,
+                        'original_size': file_path.stat().st_size,
+                        'encoded_size': None,
+                        'status': 'Copied (Non-video)'
+                    })
+                    shutil.copy2(file_path, target_file)
+            
+            progress.advance(task_id)
 
     # 結果サマリーの表示
     print_summary_table(summary_data)
@@ -788,56 +805,117 @@ def print_summary_table(summary_data: list) -> None:
     """
     if not summary_data:
         return
-        
+
     total_files = len(summary_data)
-    success_files = sum(1 for item in summary_data if item['status'].startswith('Success'))
-    skipped_files = sum(1 for item in summary_data if item['status'] == 'Skipped')
-    failed_files = sum(1 for item in summary_data if item['status'].startswith('Failed'))
-    
-    total_original_size = sum(item['original_size'] for item in summary_data if item['original_size'] is not None)
-    total_encoded_size = sum(item['encoded_size'] for item in summary_data if item['encoded_size'] is not None and item['status'].startswith('Success'))
-    
-    # エンコードされなかったファイルはそのままのサイズとして足す
+    total_original_size = 0
+    total_encoded_size = 0
+    success_files = 0
+    failed_files = 0
+    skipped_files = 0
+
     for item in summary_data:
+        if item['original_size'] is not None:
+            total_original_size += item['original_size']
+        if item['encoded_size'] is not None and item['status'].startswith('Success'):
+            success_files += 1
+            total_encoded_size += item['encoded_size']
+        elif item['status'].startswith('Failed'):
+            failed_files += 1
+            # 失敗時は元のサイズを加算（ディスク容量変化なしとして扱う）
+            if item['original_size'] is not None:
+                total_encoded_size += item['original_size']
+        elif item['status'].startswith('Skipped') or item['status'].startswith('Reverted'):
+            skipped_files += 1
+            if item['original_size'] is not None:
+                total_encoded_size += item['original_size']
+                
+        # Non-video copy
         if not item['status'].startswith('Success') and item['original_size'] is not None:
             total_encoded_size += item['original_size']
 
-    total_ratio = (total_encoded_size / total_original_size) * 100 if total_original_size > 0 else 0
+    success_count = sum(1 for d in summary_data if 'Success' in d['status'])
+    skip_copy_count = sum(1 for d in summary_data if 'Skipped' in d['status'] or 'Copied' in d['status'])
+    fail_count = sum(1 for d in summary_data if 'Failed' in d['status'])
 
-    print(f"\n================================================================================")
-    print(f"Encoding Summary")
-    print(f"================================================================================")
-    print(f" Total Files Processed : {total_files}")
-    print(f" Successfully Encoded  : {success_files}")
-    print(f" Skipped / Copied      : {skipped_files + sum(1 for i in summary_data if 'Copied' in i['status'])}")
-    print(f" Failed                : {failed_files}")
-    print(f"\n--------------------------------------------------------------------------------")
-    print(f" {'File Name':<30} | {'Original Size':>13} | {'Encoded Size':>12} | {'Ratio':>5} | {'Status'}")
-    print(f"--------------------------------------------------------------------------------")
+    console.print("\n")
     
-    for item in summary_data:
-        orig_str = f"{item['original_size'] / (1024*1024):10.2f} MB" if item['original_size'] is not None else "---"
+    # 総合結果のサマリーテキスト
+    summary_text = (
+        f"[bold]Encoding Summary[/bold]\n"
+        f" Total Files: {total_files} | "
+        f"[green]Success: {success_count}[/green] | "
+        f"[yellow]Skipped/Copied: {skip_copy_count}[/yellow] | "
+        f"[red]Failed: {fail_count}[/red]"
+    )
+    console.print(summary_text)
+
+    # ---------------------------------------------------------
+    # rich.table.Table の作成
+    # ---------------------------------------------------------
+    table = Table(title="File Details", show_header=True, header_style="bold cyan", border_style="bright_black")
+    
+    table.add_column("File Name", style="magenta", no_wrap=True)
+    table.add_column("Original Size", justify="right")
+    table.add_column("Encoded Size", justify="right")
+    table.add_column("Ratio", justify="right")
+    table.add_column("Status")
+
+    total_orig_size = 0
+    total_enc_size = 0
+    
+    for row in summary_data:
+        name = row['name']
+        orig_size = row['original_size']
+        enc_size = row['encoded_size']
+        status = row['status']
         
-        if item['encoded_size'] is not None and item['status'].startswith('Success'):
-            enc_str = f"{item['encoded_size'] / (1024*1024):9.2f} MB"
-            ratio = (item['encoded_size'] / item['original_size']) * 100 if item['original_size'] else 0
-            ratio_str = f"{ratio:4.1f}%"
-        else:
-            enc_str = "        ---  "
-            ratio_str = " --- "
+        orig_mb = orig_size / (1024 * 1024) if orig_size else 0
+        total_orig_size += orig_size if orig_size else 0
+        
+        if enc_size is not None:
+            enc_mb = enc_size / (1024 * 1024)
+            ratio = (enc_size / orig_size * 100) if orig_size > 0 else 0
+            total_enc_size += enc_size
             
-        name_str = item['name']
-        if len(name_str) > 30:
-            name_str = name_str[:27] + "..."
-        
-        print(f" {name_str:<30} | {orig_str:>13} | {enc_str:>12} | {ratio_str:>5} | {item['status']}")
-        
-    print(f"--------------------------------------------------------------------------------")
-    orig_total_str = f"{total_original_size / (1024*1024):10.2f} MB"
-    enc_total_str = f"{total_encoded_size / (1024*1024):9.2f} MB"
+            orig_str = f"{orig_mb:.2f} MB"
+            enc_str = f"{enc_mb:.2f} MB"
+            ratio_str = f"{ratio:.1f}%"
+        else:
+            total_enc_size += orig_size if orig_size else 0
+            
+            orig_str = f"{orig_mb:.2f} MB"
+            enc_str = "---"
+            ratio_str = "---"
+            
+        # ステータスによって色付け
+        status_styled = status
+        if "Success" in status:
+            status_styled = f"[green]{status}[/green]"
+        elif "Failed" in status:
+            status_styled = f"[red]{status}[/red]"
+        elif "Reverted" in status:
+            status_styled = f"[yellow]{status}[/yellow]"
+        elif "Skipped" in status or "Copied" in status:
+            status_styled = f"[dim]{status}[/dim]"
+            
+        table.add_row(name, orig_str, enc_str, ratio_str, status_styled)
+
+    # フッター行（合計サイズ）
+    total_orig_mb = total_orig_size / (1024 * 1024) if total_orig_size else 0
+    total_enc_mb = total_enc_size / (1024 * 1024) if total_enc_size else 0
+    total_ratio = (total_enc_size / total_orig_size * 100) if total_orig_size > 0 else 100.0
     
-    print(f" {'Total Size':<30} | {orig_total_str:>13} | {enc_total_str:>12} | {total_ratio:4.1f}% |")
-    print(f"================================================================================\n")
+    table.add_section() # 区切り線
+    table.add_row(
+        "[bold]Total[/bold]",
+        f"[bold]{total_orig_mb:.2f} MB[/bold]",
+        f"[bold]{total_enc_mb:.2f} MB[/bold]",
+        f"[bold]{total_ratio:.1f}%[/bold]",
+        ""
+    )
+    
+    console.print(table)
+    console.print()
 
 if __name__ == '__main__':
     main()
