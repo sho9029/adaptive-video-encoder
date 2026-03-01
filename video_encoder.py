@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # 定数定義
 DEFAULT_MIN_SSIM = 0.985
 DEFAULT_MAX_SSIM = 1.0  # デフォルトは制限なし
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 
 CODEC_CONFIGS = {
     'av1_nvenc': {'quality': 38, 'preset': 'p7'},
