@@ -7,14 +7,30 @@ import shutil
 import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from tqdm import tqdm
 
 # ロギング設定
+# プログレスバー（tqdm）と標準出力が混ざらないように、カスタムのTqdmLoggingHandlerを定義する
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+# フォーマットを [HH:MM:SS] [LEVEL] メッセージ という形にスッキリさせる
+formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+handler = TqdmLoggingHandler()
+handler.setFormatter(formatter)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -138,13 +154,14 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
     ]
     
     try:
-        logger.info(f"Calculating SSIM for {encoded_path.name}...")
+        # SSIM計算中は進行中を示すのみとするため、冗長なログは省くか短くする
+        # logger.info(f"  Calculating SSIM...") # Encodingの横などに結果をくっつける方が綺麗なのでここでは出さない
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         # ffmpegのエラーチェック
         if result.returncode != 0:
-            logger.error(f"ffmpeg SSIM calculation failed for {encoded_path.name}")
-            logger.error(f"ffmpeg stderr: {result.stderr}")
+            logger.error(f"  ffmpeg SSIM calculation failed for {encoded_path.name}")
+            logger.error(f"  ffmpeg stderr: {result.stderr}")
             return 0.0
         
         # ffmpegの出力はstderrに出る
@@ -155,12 +172,12 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
         if match:
             return float(match.group(1))
         else:
-            logger.warning(f"Could not parse SSIM from output for {encoded_path.name}")
-            logger.warning(f"ffmpeg output: {output}")
+            logger.warning(f"  Could not parse SSIM from output")
+            logger.warning(f"  ffmpeg output: {output}")
             return 0.0
             
     except Exception as e:
-        logger.error(f"Error calculating SSIM: {e}")
+        logger.error(f"  Error calculating SSIM: {e}")
         return 0.0
 
 def encode_video(
@@ -214,21 +231,22 @@ def encode_video(
     cmd.append(str(output_path))
 
     try:
-        logger.info(f"Encoding {input_path.name} (Codec: {codec}, Q: {quality_value}, Audio: {audio_codec}/{audio_bitrate})")
+        logger.info(f"  Encoding... (Codec: {codec}, Q: {quality_value}, Audio: {audio_codec}/{audio_bitrate})")
         subprocess.run(cmd, check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Encoding failed for {input_path.name}: {e}")
+        logger.error(f"  Encoding failed for {input_path.name}: {e}")
         # エラー出力を表示
         if e.stderr:
-            logger.error(e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr)
+            logger.error(f"  {e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr}")
         return False
 
 def process_file(
     source_file: Path,
     source_root: Path,
     target_root: Path,
-    args: argparse.Namespace
+    args: argparse.Namespace,
+    summary_data: list
 ) -> bool:
     """
     1つのファイルを処理する。
@@ -236,18 +254,36 @@ def process_file(
     """
     # エンコード済みチェック（--force が指定されていない場合）
     if not args.force and is_encoded_by_tool(source_file):
-        logger.info(f"Skipping already encoded file: {source_file.name}")
+        logger.info(f"  Skipped already encoded file")
+        summary_data.append({
+            'name': source_file.name,
+            'original_size': source_file.stat().st_size,
+            'encoded_size': None,
+            'status': 'Skipped'
+        })
         return False
     # 相対パスを計算してターゲットパスを決定
     rel_path = source_file.relative_to(source_root)
     # コンテナをmp4に変更
     target_file = target_root / rel_path.with_suffix('.mp4')
 
+    # 同一ファイル上書き（In-place）かどうかの判定
+    in_place = source_file.resolve() == target_file.resolve()
+    
+    # ffmpegの出力先ファイルパスを設定（上書きの場合は一時ファイルを使用）
+    encode_target_file = target_file.with_name(f".tmp.{target_file.name}") if in_place else target_file
+
     # 動画情報の詳細を取得
     source_info = get_video_info(source_file)
     if not source_info:
-        logger.warning(f"Failed to get video info for {source_file}. Skipping.")
-        return
+        logger.warning(f"  Failed to get video info. Skipping.")
+        summary_data.append({
+            'name': source_file.name,
+            'original_size': source_file.stat().st_size,
+            'encoded_size': None,
+            'status': 'Failed (Probe)'
+        })
+        return False
 
     # 音声設定の決定
     audio_codec = 'aac'
@@ -273,7 +309,7 @@ def process_file(
     for attempt in range(args.max_retries + 1):
         success = encode_video(
             source_file,
-            target_file,
+            encode_target_file,
             args.codec,
             current_quality,
             args.preset,
@@ -282,41 +318,70 @@ def process_file(
         )
 
         if not success:
-            logger.error(f"Failed to encode {source_file}. Skipping.")
-            return
+            logger.error(f"  Failed to encode. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Encode)'
+            })
+            return False
 
         # 解像度チェック
-        target_info = get_video_info(target_file)
+        target_info = get_video_info(encode_target_file)
         if not target_info:
-            logger.error(f"Failed to get info for encoded file {target_file}. Skipping.")
-            return
+            logger.error(f"  Failed to get info for encoded file. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Target Probe)'
+            })
+            # 失敗時は一時ファイルを削除
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
+            return False
 
         # 映像ストリームを探す
         src_video_streams = [s for s in source_info['streams'] if s.get('codec_type') == 'video']
         tgt_video_streams = [s for s in target_info['streams'] if s.get('codec_type') == 'video']
         
         if not src_video_streams or not tgt_video_streams:
-            logger.error(f"Video stream not found for comparison. Skipping.")
-            return
+            logger.error(f"  Video stream not found for comparison. Skipping.")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (No Stream)'
+            })
+            return False
 
         src_stream = src_video_streams[0]
         tgt_stream = tgt_video_streams[0]
         
         if src_stream.get('width') != tgt_stream.get('width') or \
            src_stream.get('height') != tgt_stream.get('height'):
-            logger.error(f"Resolution mismatch for {source_file.name}: "
+            logger.error(f"  Resolution mismatch: "
                          f"{src_stream.get('width')}x{src_stream.get('height')} -> "
                          f"{tgt_stream.get('width')}x{tgt_stream.get('height')}")
-            return
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': source_file.stat().st_size,
+                'encoded_size': None,
+                'status': 'Failed (Resolution)'
+            })
+            # 失敗時は一時ファイルを削除
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
+            return False
 
         # SSIMチェック
-        ssim = calculate_ssim(source_file, target_file)
-        logger.info(f"SSIM for {source_file.name}: {ssim}")
+        ssim = calculate_ssim(source_file, encode_target_file)
 
         # サイズチェック（早期終了の判断材料）
         try:
             src_size = source_file.stat().st_size
-            tgt_size = target_file.stat().st_size
+            tgt_size = encode_target_file.stat().st_size
         except Exception:
             src_size = tgt_size = 0
 
@@ -324,67 +389,97 @@ def process_file(
             if attempt < args.max_retries:
                 # すでにサイズが元を超えている場合、品質を上げるとさらにサイズが増えるため早期終了
                 if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"Quality check failed (SSIM: {ssim} < {args.min_ssim}) and size already exceeds original ({tgt_size} > {src_size}). Stopping quality adjustment.")
+                    logger.warning(f"  SSIM: {ssim} (Failed, size already exceeds original. Stopping adjustment.)")
                     break
                 
-                logger.info(f"Quality check (SSIM: {ssim} < {args.min_ssim}). Retrying with higher quality...")
+                logger.info(f"  SSIM: {ssim} (Failed, Retrying with Q: {current_quality - 2}...)")
                 # 画質を上げる（値を下げる）
                 current_quality -= 2
                 if current_quality < 0:
                     current_quality = 0
             else:
-                logger.warning(f"Quality check failed after {args.max_retries} retries. Keeping the best attempt.")
+                logger.warning(f"  SSIM: {ssim} (Failed after {args.max_retries} retries. Keeping the best attempt.)")
                 break
         elif ssim > args.max_ssim:
             if attempt < args.max_retries:
-                logger.info(f"Quality check (SSIM: {ssim} > {args.max_ssim}). Retrying with lower quality...")
+                logger.info(f"  SSIM: {ssim} (Exceeds {args.max_ssim}, Retrying with Q: {current_quality + 2}...)")
                 # 画質を下げる（値を上げる）
                 current_quality += 2
             else:
-                logger.warning(f"Quality check: SSIM still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.")
+                logger.warning(f"  SSIM: {ssim} (Still exceeds upper limit after {args.max_retries} retries. Keeping the best attempt.)")
                 break
         else:
-            logger.info(f"Quality check passed (SSIM: {ssim} is within [{args.min_ssim}, {args.max_ssim}]).")
+            logger.info(f"  SSIM: {ssim} (Passed)")
             break
 
     # ファイルサイズの最終チェック
+    final_status = f"Success (Retry {attempt})" if attempt > 0 else "Success"
     try:
         src_size = source_file.stat().st_size
-        tgt_size = target_file.stat().st_size
+        tgt_size = encode_target_file.stat().st_size
         
         if tgt_size > src_size:
-            logger.warning(f"Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
-            # エンコードしたファイルを削除
-            if target_file.exists():
-                target_file.unlink()
-            # 元の拡張子でコピー
-            final_target = target_root / rel_path
-            final_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_file, final_target)
-            logger.info(f"Reverted to original file: {final_target.name}")
+            logger.warning(f"  Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.")
+            # エンコードしたファイル（一時ファイルまたは新規出力ファイル）を削除
+            if encode_target_file.exists():
+                encode_target_file.unlink()
+            
+            # in-place でない場合は、元のファイルを target_root にコピーして「差し戻し」を再現
+            if not in_place:
+                final_target = target_root / rel_path
+                final_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_file, final_target)
+            
+            logger.info(f"  Reverted to original file")
+            tgt_size = src_size # 元のサイズに戻ったため
+            final_status = "Reverted (Size)"
         else:
-            log_file_size_comparison(source_file, target_file)
+            log_file_size_comparison(src_size, tgt_size)
+            # サイズが小さくなり、上書き(in-place)の場合は、元のファイルを消して一時ファイルをリネーム
+            if in_place:
+                # send2trashがインストールされていれば使う（トップレベルでimportしないための設計）
+                try:
+                    # 可能ならゴミ箱へ、無理なら削除
+                    import send2trash
+                    send2trash.send2trash(str(source_file.resolve()))
+                except ImportError:
+                    source_file.unlink()
+                except Exception as e:
+                    logger.warning(f"  Failed to move original to trash, deleting directly: {e}")
+                    source_file.unlink()
+                
+                encode_target_file.rename(target_file)
+                
     except Exception as e:
-        logger.error(f"Error during final size check/fallback: {e}")
+        logger.error(f"  Error during final size check/fallback: {e}")
+        final_status = "Failed (Size Check)"
+        # エラー発生時、in-placeの一時ファイルが残っていれば削除
+        if in_place and encode_target_file.exists():
+            encode_target_file.unlink()
+
+    summary_data.append({
+        'name': source_file.name,
+        'original_size': src_size,
+        'encoded_size': tgt_size,
+        'status': final_status
+    })
 
     return True
 
-def log_file_size_comparison(source_file: Path, target_file: Path):
+def log_file_size_comparison(src_size: int, tgt_size: int):
     """
     ソースファイルとターゲットファイルのサイズを比較してログ出力する。
     """
     try:
-        src_size = source_file.stat().st_size
-        tgt_size = target_file.stat().st_size
         # 圧縮率（元のサイズに対する割合）を計算
         ratio_percent = (tgt_size / src_size) * 100 if src_size > 0 else 0
         
         src_mb = src_size / (1024 * 1024)
         tgt_mb = tgt_size / (1024 * 1024)
         
-        logger.info(f"Size: {src_mb:.2f}MB -> {tgt_mb:.2f}MB (Compressed: {ratio_percent:.1f}%)")
+        logger.info(f"  Size: {src_mb:.2f}MB -> {tgt_mb:.2f}MB (Compressed: {ratio_percent:.1f}%)")
     except Exception as e:
-        logger.warning(f"Failed to calculate file size comparison: {e}")
+        logger.warning(f"  Failed to calculate file size comparison: {e}")
 
 def check_encoded_status(target_path: Path):
     """
@@ -523,10 +618,10 @@ def main():
         logger.error(f"Source directory not found: {args.source_dir}")
         sys.exit(1)
 
-    # 安全対策: ソースとターゲットが同じ場合はエラー
-    if args.source_dir.resolve() == args.target_dir.resolve():
-        logger.error("Error: Source and target directories must be different to prevent accidental overwriting.")
-        sys.exit(1)
+    # 安全対策: ソースとターゲットが同じ場合のブロックを削除（In-Place Replacementサポートにより許可）
+    # if args.source_dir.resolve() == args.target_dir.resolve():
+    #     logger.error("Error: Source and target directories must be different to prevent accidental overwriting.")
+    #     sys.exit(1)
 
     # ファイル探索
     logger.debug(f"Scanning files in {args.source_dir}...")
@@ -534,15 +629,18 @@ def main():
     
     # ファイルごとに動画判定を行いながら順次処理
     logger.info(f"Found {len(all_files)} files in {args.source_dir}")
-    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, MinSSIM={args.min_ssim}, MaxSSIM={args.max_ssim}")
+    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, MinSSIM={args.min_ssim}, MaxSSIM={args.max_ssim}\n")
 
-    for file_path in all_files:
+    summary_data = []
+
+    for i, file_path in enumerate(tqdm(all_files, desc="Processing Videos", dynamic_ncols=True, leave=True)):
         # 隠しファイル除外
         if file_path.name.startswith('.'):
             continue
 
         if is_video_file(file_path):
-            process_file(file_path, args.source_dir, args.target_dir, args)
+            logger.info(f"Processing [{i+1}/{len(all_files)}]: {file_path.name}")
+            process_file(file_path, args.source_dir, args.target_dir, args, summary_data)
         else:
             # 動画でない場合はそのままコピー
             rel_path = file_path.relative_to(args.source_dir)
@@ -551,8 +649,76 @@ def main():
             # 出力先ディレクトリの準備
             target_file.parent.mkdir(parents=True, exist_ok=True)
             
-            logger.info(f"Copying non-video file: {file_path.name} -> {target_file.name}")
-            shutil.copy2(file_path, target_file)
+            logger.info(f"Processing [{i+1}/{len(all_files)}]: {file_path.name} (Non-video)")
+            
+            # 自身へのコピーを防ぐ
+            if file_path.resolve() == target_file.resolve():
+                summary_data.append({
+                    'name': file_path.name,
+                    'original_size': file_path.stat().st_size,
+                    'encoded_size': None,
+                    'status': 'Skipped (In-place non-video)'
+                })
+            else:
+                summary_data.append({
+                    'name': file_path.name,
+                    'original_size': file_path.stat().st_size,
+                    'encoded_size': None,
+                    'status': 'Copied (Non-video)'
+                })
+                shutil.copy2(file_path, target_file)
+
+    # 結果サマリーの表示
+    if summary_data:
+        total_files = len(summary_data)
+        success_files = sum(1 for item in summary_data if item['status'].startswith('Success'))
+        skipped_files = sum(1 for item in summary_data if item['status'] == 'Skipped')
+        failed_files = sum(1 for item in summary_data if item['status'].startswith('Failed'))
+        
+        total_original_size = sum(item['original_size'] for item in summary_data if item['original_size'] is not None)
+        total_encoded_size = sum(item['encoded_size'] for item in summary_data if item['encoded_size'] is not None and item['status'].startswith('Success'))
+        
+        # エンコードされなかったファイルはそのままのサイズとして足す
+        for item in summary_data:
+            if not item['status'].startswith('Success') and item['original_size'] is not None:
+                total_encoded_size += item['original_size']
+
+        total_ratio = (total_encoded_size / total_original_size) * 100 if total_original_size > 0 else 0
+
+        print(f"\n================================================================================")
+        print(f"Encoding Summary")
+        print(f"================================================================================")
+        print(f" Total Files Processed : {total_files}")
+        print(f" Successfully Encoded  : {success_files}")
+        print(f" Skipped / Copied      : {skipped_files + sum(1 for i in summary_data if 'Copied' in i['status'])}")
+        print(f" Failed                : {failed_files}")
+        print(f"\n--------------------------------------------------------------------------------")
+        print(f" {'File Name':<30} | {'Original Size':>13} | {'Encoded Size':>12} | {'Ratio':>5} | {'Status'}")
+        print(f"--------------------------------------------------------------------------------")
+        
+        for item in summary_data:
+            orig_str = f"{item['original_size'] / (1024*1024):10.2f} MB" if item['original_size'] is not None else "---"
+            
+            if item['encoded_size'] is not None and item['status'].startswith('Success'):
+                enc_str = f"{item['encoded_size'] / (1024*1024):9.2f} MB"
+                ratio = (item['encoded_size'] / item['original_size']) * 100 if item['original_size'] else 0
+                ratio_str = f"{ratio:4.1f}%"
+            else:
+                enc_str = "        ---  "
+                ratio_str = " --- "
+                
+            name_str = item['name']
+            if len(name_str) > 30:
+                name_str = name_str[:27] + "..."
+            
+            print(f" {name_str:<30} | {orig_str:>13} | {enc_str:>12} | {ratio_str:>5} | {item['status']}")
+            
+        print(f"--------------------------------------------------------------------------------")
+        orig_total_str = f"{total_original_size / (1024*1024):10.2f} MB"
+        enc_total_str = f"{total_encoded_size / (1024*1024):9.2f} MB"
+        
+        print(f" {'Total Size':<30} | {orig_total_str:>13} | {enc_total_str:>12} | {total_ratio:4.1f}% |")
+        print(f"================================================================================\n")
 
 if __name__ == '__main__':
     main()
