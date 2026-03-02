@@ -140,14 +140,18 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
     """
     ffmpegを使用して2つの動画ファイル間のSSIMを計算する。
     動画全体を通して計算し、平均SSIM (All) を返す。
+    VFR対応のため、タイムベースとPTSを正規化して比較する。
+    shortest=1 によりフレーム数の差異も安全に処理する。
     """
-    # フィルタコンプレックスでSSIMを計算し、標準エラー出力からパースする
+    # settb=1/AVTB: タイムベースをavi標準に正規化（VFR/CFR問わず一致させる）
+    # setpts=PTS-STARTPTS: PTSをゼロ起点にリセットしてフレーム位置を揃える
+    # shortest=1: フレーム数が異なる場合、短い方に合わせて比較を終了
     
     cmd = [
         'ffmpeg',
         '-i', str(encoded_path),
         '-i', str(original_path),
-        '-filter_complex', '[0:v]settb=1/1000,setpts=PTS-STARTPTS[main];[1:v]settb=1/1000,setpts=PTS-STARTPTS[ref];[main][ref]ssim',
+        '-filter_complex', '[0:v]settb=1/AVTB,setpts=PTS-STARTPTS[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS[ref];[main][ref]ssim=shortest=1',
         '-f', 'null',
         '-'
     ]
