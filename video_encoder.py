@@ -115,12 +115,14 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     """
     ffprobeを使用して動画ファイルの情報を取得する。
     動画ストリームが存在しない場合はNoneを返す。
+    side_data（display_matrix等）も取得する。
     """
     cmd = [
         'ffprobe',
         '-v', 'quiet',
         '-print_format', 'json',
         '-show_streams',
+        '-show_entries', 'stream_side_data',
         str(file_path)
     ]
     try:
@@ -135,6 +137,34 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         logger.debug(f"Failed to decode ffprobe output for {file_path}")
         return None
+
+def get_video_rotation(stream: dict) -> int:
+    """
+    映像ストリーム情報から回転角度を取得する（0, 90, 180, 270）。
+    side_data_list の Display Matrix と tags.rotate の両方を確認する。
+    """
+    rotation = 0
+
+    # 1. side_data_list から Display Matrix の rotation を取得（優先）
+    for sd in stream.get('side_data_list', []):
+        if sd.get('side_data_type') == 'Display Matrix' and 'rotation' in sd:
+            rotation = int(float(sd['rotation']))
+            break
+
+    # 2. tags.rotate にフォールバック
+    if rotation == 0:
+        rotate_tag = stream.get('tags', {}).get('rotate', '0')
+        try:
+            rotation = int(float(rotate_tag))
+        except (ValueError, TypeError):
+            rotation = 0
+
+    # 正規化: -90 → 270 等に統一（0, 90, 180, 270）
+    rotation = rotation % 360
+    if rotation < 0:
+        rotation += 360
+
+    return rotation
 
 def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
     """
@@ -222,6 +252,8 @@ def encode_video(
 
     # メタデータ転送とMP4最適化、エンコーダー識別タグの追加
     cmd.extend(['-map_metadata', '0', '-movflags', '+faststart'])
+    # autorotateで物理回転済みのため、rotateタグを明示的に除去（二重回転防止）
+    cmd.extend(['-metadata:s:v', 'rotate='])
     # MP4コンテナの互換性を考慮し、comment タグにも情報を埋め込む
     cmd.extend(['-metadata', f'encoder_tool={ENCODER_TOOL_NAME}'])
     cmd.extend(['-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'])
@@ -336,11 +368,21 @@ def run_encode_with_retry(
         src_stream = src_video_streams[0]
         tgt_stream = tgt_video_streams[0]
         
-        if src_stream.get('width') != tgt_stream.get('width') or \
-           src_stream.get('height') != tgt_stream.get('height'):
+        # 回転による幅高入れ替わりを考慮した解像度比較
+        src_rotation = get_video_rotation(src_stream)
+        src_w = src_stream.get('width')
+        src_h = src_stream.get('height')
+        if src_rotation in (90, 270):
+            # 90°/270°回転ではautorotateにより幅と高さが入れ替わる
+            src_w, src_h = src_h, src_w
+        
+        tgt_w = tgt_stream.get('width')
+        tgt_h = tgt_stream.get('height')
+        
+        if src_w != tgt_w or src_h != tgt_h:
             logger.error(f"  Resolution mismatch: "
-                         f"{src_stream.get('width')}x{src_stream.get('height')} -> "
-                         f"{tgt_stream.get('width')}x{tgt_stream.get('height')}")
+                         f"{src_w}x{src_h} (display) -> "
+                         f"{tgt_w}x{tgt_h}")
             summary_data.append({
                 'name': source_file.name,
                 'original_size': source_file.stat().st_size,
