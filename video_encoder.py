@@ -20,6 +20,7 @@ from rich.progress import (
     TimeRemainingColumn
 )
 from rich.table import Table
+from rich.highlighter import NullHighlighter
 
 # --- rich Console の初期化 ---
 console = Console()
@@ -29,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%H:%M:%S]",
-    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False, markup=True, highlighter=None)]
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False, markup=True, highlighter=NullHighlighter())]
 )
 logger = logging.getLogger(__name__)
 
