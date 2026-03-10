@@ -217,23 +217,47 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
         logger.error(f"  Error calculating SSIM: {e}")
         return 0.0
 
-def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: int) -> float:
+def check_cuda_vmaf_support() -> bool:
+    """
+    ffmpegが libvmaf_cuda フィルタをサポートしているか判定する。
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-filters'],
+            capture_output=True, text=True
+        )
+        return 'libvmaf_cuda' in result.stdout
+    except Exception:
+        return False
+
+def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: int, use_hwaccel: bool = False) -> float:
     """
     ffmpegを使用して2つの動画ファイル間のVMAFを計算する。
     動画の総画素数に基づき、1080p相当以下なら標準モデル、それ以上なら4K専用モデルに切り替える。
-    ハードウェアアクセラレーション（CUDA）を使用して計算する。
+    use_hwaccelがTrueならハードウェアアクセラレーション（CUDA）を使用するが、これにはカスタムビルド版のFFmpeg（libvmaf_cuda対応）が必要。
+    Falseの場合は一般的なFFmpeg（libvmaf有効化版）でCPUを用いて計算する。
     """
     pixel_area = src_w * src_h
     model_name = 'vmaf_4k_v0.6.1neg' if pixel_area > 1920 * 1080 else 'vmaf_v0.6.1neg'
 
-    cmd = [
-        'ffmpeg',
-        '-hwaccel', 'cuda', '-i', str(encoded_path),
-        '-hwaccel', 'cuda', '-i', str(original_path),
-        '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
-        '-f', 'null',
-        '-'
-    ]
+    if use_hwaccel:
+        cmd = [
+            'ffmpeg',
+            '-hwaccel', 'cuda', '-i', str(encoded_path),
+            '-hwaccel', 'cuda', '-i', str(original_path),
+            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
+            '-f', 'null',
+            '-'
+        ]
+    else:
+        cmd = [
+            'ffmpeg',
+            '-i', str(encoded_path),
+            '-i', str(original_path),
+            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS[ref];[main][ref]libvmaf=model=version={model_name}',
+            '-f', 'null',
+            '-'
+        ]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -437,7 +461,7 @@ def run_encode_with_retry(
             return False, attempt
 
         # スコアチェック
-        score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h)
+        score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h, args.vmaf_hwaccel)
         history.append((current_quality, score))
 
         # サイズチェック（早期終了の判断材料）
@@ -819,6 +843,11 @@ def main():
         check_encoded_status(args.check)
         return
 
+    # VMAFのハードウェアサポート自動判定
+    args.vmaf_hwaccel = False
+    if args.metric == 'vmaf':
+        args.vmaf_hwaccel = check_cuda_vmaf_support()
+
     # デフォルト値の設定（共通ロジック）
     # コーデックごとのデフォルト設定を取得
     config = CODEC_CONFIGS.get(args.codec)
@@ -849,9 +878,12 @@ def main():
     logger.debug(f"Scanning files in {args.source_dir}...")
     all_files = sorted([p for p in args.source_dir.rglob('*') if p.is_file()])
     
+    hwaccel_str = "(CUDA)" if args.vmaf_hwaccel else "(CPU)"
+    vmaf_info = f", VMAF_Mode={hwaccel_str}" if args.metric == 'vmaf' else ""
+    
     # ファイルごとに動画判定を行いながら順次処理
     logger.info(f"Found {len(all_files)} files in {args.source_dir}")
-    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, Metric={args.metric.upper()}, MinScore={args.min_score}, MaxScore={args.max_score}\n")
+    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, Metric={args.metric.upper()}{vmaf_info}, MinScore={args.min_score}, MaxScore={args.max_score}\n")
 
     summary_data = []
 
