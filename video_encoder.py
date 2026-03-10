@@ -35,8 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 定数定義
-DEFAULT_MIN_SSIM = 0.985
-DEFAULT_MAX_SSIM = 1.0  # デフォルトは制限なし
+DEFAULT_METRIC = 'vmaf'
+DEFAULT_MIN_SCORE_SSIM = 0.985
+DEFAULT_MAX_SCORE_SSIM = 1.0  # デフォルトは制限なし
+DEFAULT_MIN_SCORE_VMAF = 93.0
+DEFAULT_MAX_SCORE_VMAF = 100.0
 DEFAULT_MAX_RETRIES = 5
 
 CODEC_CONFIGS = {
@@ -212,6 +215,45 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
             
     except Exception as e:
         logger.error(f"  Error calculating SSIM: {e}")
+        return 0.0
+
+def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: int) -> float:
+    """
+    ffmpegを使用して2つの動画ファイル間のVMAFを計算する。
+    動画の総画素数に基づき、1080p相当以下なら標準モデル、それ以上なら4K専用モデルに切り替える。
+    ハードウェアアクセラレーション（CUDA）を使用して計算する。
+    """
+    pixel_area = src_w * src_h
+    model_name = 'vmaf_4k_v0.6.1neg' if pixel_area > 1920 * 1080 else 'vmaf_v0.6.1neg'
+
+    cmd = [
+        'ffmpeg',
+        '-hwaccel', 'cuda', '-i', str(encoded_path),
+        '-hwaccel', 'cuda', '-i', str(original_path),
+        '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
+        '-f', 'null',
+        '-'
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"  ffmpeg VMAF calculation failed for {encoded_path.name}")
+            logger.error(f"  ffmpeg stderr: {result.stderr}")
+            return 0.0
+            
+        output = result.stderr
+        match = re.search(r'VMAF score: ([0-9.]+)', output)
+        if match:
+            return float(match.group(1))
+        else:
+            logger.warning(f"  Could not parse VMAF from output")
+            logger.warning(f"  ffmpeg output: {output}")
+            return 0.0
+            
+    except Exception as e:
+        logger.error(f"  Error calculating VMAF: {e}")
         return 0.0
 
 def encode_video(
@@ -394,9 +436,9 @@ def run_encode_with_retry(
                 encode_target_file.unlink()
             return False, attempt
 
-        # SSIMチェック
-        ssim = calculate_ssim(source_file, encode_target_file)
-        history.append((current_quality, ssim))
+        # スコアチェック
+        score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h)
+        history.append((current_quality, score))
 
         # サイズチェック（早期終了の判断材料）
         try:
@@ -405,34 +447,37 @@ def run_encode_with_retry(
         except Exception:
             src_size = tgt_size = 0
 
-        if ssim < args.min_ssim:
+        metric_name = args.metric.upper()
+
+        if score < args.min_score:
             if attempt < args.max_retries:
                 if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red], size already exceeds original. Stopping adjustment.)")
+                    logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], size already exceeds original. Stopping adjustment.)")
                     # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
                     summary_data.append({
                         'name': source_file.name,
                         'original_size': src_size,
                         'encoded_size': None,
-                        'status': f'Failed (SSIM {ssim:.3f} < {args.min_ssim})'
+                        'status': f'Failed ({metric_name} {score:.3f} < {args.min_score})'
                     })
                     if encode_target_file.exists():
                         encode_target_file.unlink()
                     return False, attempt
                 
                 # --- 非線形画質調整 (Secant / P制御) ---
-                target_ssim = args.min_ssim + 0.002
+                target_score = args.min_score + (0.002 if args.metric == 'ssim' else 0.5)
                 if len(history) >= 2:
                     q1, s1 = history[-2]
                     q2, s2 = history[-1]
-                    if s2 == s1: # SSIMが全く変化しなかった場合の保護
+                    if s2 == s1: # スコアが全く変化しなかった場合の保護
                         delta_q = -1.0
                     else:
                         slope = (q2 - q1) / (s2 - s1)
-                        delta_q = slope * (target_ssim - s2)
+                        delta_q = slope * (target_score - s2)
                 else:
-                    # 履歴が1つしかない場合はP制御（K = 200）で推測
-                    delta_q = -200.0 * (target_ssim - ssim)
+                    # 履歴が1つしかない場合はP制御で推測
+                    p_gain = -200.0 if args.metric == 'ssim' else -2.0
+                    delta_q = p_gain * (target_score - score)
                 
                 # 極端な変動を防ぐためのクリッピング（±6）
                 delta_q = max(-6.0, min(6.0, delta_q))
@@ -443,24 +488,24 @@ def run_encode_with_retry(
                     next_q -= 1
                 
                 next_q = max(0, next_q) # 負のQ値は避ける
-                logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
+                logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
                 current_quality = next_q
             else:
-                logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([red]Failed[/red] after {args.max_retries} retries. Target minimum SSIM not reached.)")
+                logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red] after {args.max_retries} retries. Target minimum {metric_name} not reached.)")
                 summary_data.append({
                     'name': source_file.name,
                     'original_size': src_size,
                     'encoded_size': None,
-                    'status': f'Failed (SSIM Limit)'
+                    'status': f'Failed ({metric_name} Limit)'
                 })
                 # 目標画質に達しなかったので結果を破棄（一時ファイルを削除）
                 if encode_target_file.exists():
                     encode_target_file.unlink()
                 return False, attempt
-        elif ssim > args.max_ssim:
+        elif score > args.max_score:
             if attempt < args.max_retries:
                 # --- 非線形画質調整 (Secant / P制御) ---
-                target_ssim = args.max_ssim - 0.002
+                target_score = args.max_score - (0.002 if args.metric == 'ssim' else 0.5)
                 if len(history) >= 2:
                     q1, s1 = history[-2]
                     q2, s2 = history[-1]
@@ -468,9 +513,10 @@ def run_encode_with_retry(
                         delta_q = 1.0
                     else:
                         slope = (q2 - q1) / (s2 - s1)
-                        delta_q = slope * (target_ssim - s2)
+                        delta_q = slope * (target_score - s2)
                 else:
-                    delta_q = -200.0 * (target_ssim - ssim)
+                    p_gain = -200.0 if args.metric == 'ssim' else -2.0
+                    delta_q = p_gain * (target_score - score)
                 
                 delta_q = max(-6.0, min(6.0, delta_q))
                 next_q = round(current_quality + delta_q)
@@ -478,13 +524,13 @@ def run_encode_with_retry(
                 if next_q == current_quality:
                     next_q += 1
                 
-                logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([yellow]Exceeds {args.max_ssim}[/yellow], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
+                logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([yellow]Exceeds {args.max_score}[/yellow], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
                 current_quality = next_q
             else:
-                logger.warning(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([yellow]Still exceeds upper limit[/yellow] after {args.max_retries} retries. Keeping this attempt as success.)")
+                logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([yellow]Still exceeds upper limit[/yellow] after {args.max_retries} retries. Keeping this attempt as success.)")
                 break
         else:
-            logger.info(f"  SSIM: [cyan]{ssim:.5f}[/cyan] ([green]Passed[/green])")
+            logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([green]Passed[/green])")
             break
 
     return True, attempt
@@ -692,11 +738,18 @@ def parse_arguments() -> argparse.Namespace:
         
         preset = input("プリセット (デフォルト: 自動設定): ").strip() or None
         
-        min_ssim_str = input(f"最小SSIM (デフォルト: {DEFAULT_MIN_SSIM}): ").strip()
-        min_ssim = float(min_ssim_str) if min_ssim_str else DEFAULT_MIN_SSIM
+        metric = input(f"評価指標 (ssim/vmaf) (デフォルト: {DEFAULT_METRIC}): ").strip().lower() or DEFAULT_METRIC
+        if metric not in ('ssim', 'vmaf'):
+            logger.warning(f"'{metric}' は無効な評価指標です。デフォルトの '{DEFAULT_METRIC}' を使用します。")
+            metric = DEFAULT_METRIC
+
+        default_min = DEFAULT_MIN_SCORE_SSIM if metric == 'ssim' else DEFAULT_MIN_SCORE_VMAF
+        min_score_str = input(f"最小スコア (デフォルト: {default_min}): ").strip()
+        min_score = float(min_score_str) if min_score_str else default_min
         
-        max_ssim_str = input(f"最大SSIM (デフォルト: {DEFAULT_MAX_SSIM}): ").strip()
-        max_ssim = float(max_ssim_str) if max_ssim_str else DEFAULT_MAX_SSIM
+        default_max = DEFAULT_MAX_SCORE_SSIM if metric == 'ssim' else DEFAULT_MAX_SCORE_VMAF
+        max_score_str = input(f"最大スコア (デフォルト: {default_max}): ").strip()
+        max_score = float(max_score_str) if max_score_str else default_max
         
         max_retries_str = input(f"最大再試行回数 (デフォルト: {DEFAULT_MAX_RETRIES}): ").strip()
         max_retries = int(max_retries_str) if max_retries_str else DEFAULT_MAX_RETRIES
@@ -710,9 +763,11 @@ def parse_arguments() -> argparse.Namespace:
             codec=codec,
             quality=quality,
             preset=preset,
-            min_ssim=min_ssim,
-            max_ssim=max_ssim,
+            metric=metric,
+            min_score=min_score,
+            max_score=max_score,
             max_retries=max_retries,
+
             force=force,
             check=None
         )
@@ -734,11 +789,18 @@ def parse_arguments() -> argparse.Namespace:
         
         parser.add_argument('--preset', type=str, help='Encoding preset. Default depends on codec.')
         
-        parser.add_argument('--min-ssim', type=float, default=DEFAULT_MIN_SSIM, help=f'Minimum SSIM threshold (default: {DEFAULT_MIN_SSIM})')
-        parser.add_argument('--max-ssim', type=float, default=DEFAULT_MAX_SSIM, help=f'Maximum SSIM threshold (default: {DEFAULT_MAX_SSIM})')
+        parser.add_argument('--metric', type=str, default=DEFAULT_METRIC, choices=['ssim', 'vmaf'], help=f'Quality metric (default: {DEFAULT_METRIC})')
+        parser.add_argument('--min-score', type=float, help='Minimum score threshold (default: depends on metric)')
+        parser.add_argument('--max-score', type=float, help='Maximum score threshold (default: depends on metric)')
         parser.add_argument('--max-retries', type=int, default=DEFAULT_MAX_RETRIES, help=f'Maximum retries for quality adjustment (default: {DEFAULT_MAX_RETRIES})')
 
         args = parser.parse_args()
+        
+        if args.min_score is None:
+            args.min_score = DEFAULT_MIN_SCORE_SSIM if args.metric == 'ssim' else DEFAULT_MIN_SCORE_VMAF
+        if args.max_score is None:
+            args.max_score = DEFAULT_MAX_SCORE_SSIM if args.metric == 'ssim' else DEFAULT_MAX_SCORE_VMAF
+
         
         # source_dir と target_dir の必須チェック
         if not args.check and (not args.source_dir or not args.target_dir):
@@ -786,7 +848,7 @@ def main():
     
     # ファイルごとに動画判定を行いながら順次処理
     logger.info(f"Found {len(all_files)} files in {args.source_dir}")
-    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, MinSSIM={args.min_ssim}, MaxSSIM={args.max_ssim}\n")
+    logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, Metric={args.metric.upper()}, MinScore={args.min_score}, MaxScore={args.max_score}\n")
 
     summary_data = []
 
