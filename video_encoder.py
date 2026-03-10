@@ -733,10 +733,13 @@ def parse_arguments() -> argparse.Namespace:
             logger.warning(f"'{codec}' は利用可能なコーデックではありません。デフォルトの '{DEFAULT_CODEC}' を使用します。")
             codec = DEFAULT_CODEC
         
-        quality_str = input("画質 (デフォルト: 自動設定): ").strip()
+        config = CODEC_CONFIGS.get(codec)
+        default_quality = config['quality'] if config else '自動設定'
+        quality_str = input(f"画質 (デフォルト: {default_quality}): ").strip()
         quality = float(quality_str) if quality_str else None
         
-        preset = input("プリセット (デフォルト: 自動設定): ").strip() or None
+        default_preset = config['preset'] if config else '自動設定'
+        preset = input(f"プリセット (デフォルト: {default_preset}): ").strip() or None
         
         metric = input(f"評価指標 (ssim/vmaf) (デフォルト: {DEFAULT_METRIC}): ").strip().lower() or DEFAULT_METRIC
         if metric not in ('ssim', 'vmaf'):
@@ -754,7 +757,7 @@ def parse_arguments() -> argparse.Namespace:
         max_retries_str = input(f"最大再試行回数 (デフォルト: {DEFAULT_MAX_RETRIES}): ").strip()
         max_retries = int(max_retries_str) if max_retries_str else DEFAULT_MAX_RETRIES
         
-        force_str = input("既にエンコード済みのファイルも再処理しますか？ (y/N): ").strip().lower()
+        force_str = input("既にエンコード済みのファイルも再処理しますか？ (y/n) (デフォルト: n): ").strip().lower()
         force = force_str in ('y', 'yes')
         
         args = argparse.Namespace(
