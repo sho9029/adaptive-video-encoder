@@ -243,8 +243,8 @@ def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: i
     if use_hwaccel:
         cmd = [
             'ffmpeg',
-            '-hwaccel', 'cuda', '-i', str(encoded_path),
-            '-hwaccel', 'cuda', '-i', str(original_path),
+            '-hwaccel', 'cuda', '-threads', '8', '-i', str(encoded_path),
+            '-hwaccel', 'cuda', '-threads', '8', '-i', str(original_path),
             '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
             '-f', 'null',
             '-'
