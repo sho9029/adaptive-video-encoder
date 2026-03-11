@@ -476,7 +476,9 @@ def run_encode_with_retry(
         if score < args.min_score:
             if attempt < args.max_retries:
                 if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], size already exceeds original. Stopping adjustment.)")
+                    logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], stopping adjustment)")
+                    logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
+                    logger.info(f"  [yellow]Reverted to original file[/yellow]")
                     # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
                     summary_data.append({
                         'name': source_file.name,
@@ -581,7 +583,7 @@ def finalize_encoded_file(
         tgt_size = encode_target_file.stat().st_size
         
         if tgt_size > src_size:
-            logger.warning(f"  [yellow]Final encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
+            logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
             if encode_target_file.exists():
                 encode_target_file.unlink()
             
