@@ -478,6 +478,30 @@ def run_encode_with_retry(
                 if tgt_size > src_size and src_size > 0:
                     logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], stopping adjustment)")
                     logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
+                    
+                    # 元ファイルに処理済みタグを付与
+                    tag_cmd = [
+                        'ffmpeg', '-y', '-i', str(source_file),
+                        '-c', 'copy', '-map', '0',
+                        '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
+                        '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
+                    ]
+                    # mp4/mov等の場合は上書きが直接できないため一時ファイルを経由する
+                    target_ext = source_file.suffix.lower()
+                    if target_ext in ['.mp4', '.mov', '.m4v']:
+                        tmp_src = source_file.with_name(f".tmp.tag_{source_file.name}")
+                        tag_cmd.append(str(tmp_src))
+                        try:
+                            subprocess.run(tag_cmd, capture_output=True, check=True)
+                            if tmp_src.exists():
+                                shutil.move(str(tmp_src), str(source_file))
+                        except Exception as e:
+                            logger.debug(f"Failed to tag original file: {e}")
+                            if tmp_src.exists():
+                                tmp_src.unlink()
+                    else:
+                        pass
+
                     logger.info(f"  [yellow]Reverted to original file[/yellow]")
                     # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
                     summary_data.append({
@@ -591,9 +615,33 @@ def finalize_encoded_file(
                 final_target = target_root / rel_path
                 final_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_file, final_target)
+                target_to_tag = final_target
+            else:
+                target_to_tag = source_file
+
+            # 元ファイル（またはコピー先）に処理済みタグを付与
+            tag_cmd = [
+                'ffmpeg', '-y', '-i', str(target_to_tag),
+                '-c', 'copy', '-map', '0',
+                '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
+                '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
+            ]
+            
+            target_ext = target_to_tag.suffix.lower()
+            if target_ext in ['.mp4', '.mov', '.m4v', '.mkv', '.webm']:
+                tmp_src = target_to_tag.with_name(f".tmp.tag_{target_to_tag.name}")
+                tag_cmd.append(str(tmp_src))
+                try:
+                    subprocess.run(tag_cmd, capture_output=True, check=True)
+                    if tmp_src.exists():
+                        shutil.move(str(tmp_src), str(target_to_tag))
+                except Exception as e:
+                    logger.debug(f"Failed to tag original file: {e}")
+                    if tmp_src.exists():
+                        tmp_src.unlink()
             
             logger.info(f"  [yellow]Reverted to original file[/yellow]")
-            tgt_size = src_size # 元のサイズに戻ったため
+            tgt_size = target_to_tag.stat().st_size # タグ付与後のサイズを取得
             final_status = "Reverted (Size)"
         else:
             log_file_size_comparison(src_size, tgt_size)
