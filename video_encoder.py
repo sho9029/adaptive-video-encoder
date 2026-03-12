@@ -1059,7 +1059,7 @@ def print_summary_table(summary_data: list) -> None:
     # ---------------------------------------------------------
     table = Table(title="File Details", show_header=True, header_style="bold cyan", border_style="bright_black")
     
-    table.add_column("File Name", style="magenta", no_wrap=True)
+    table.add_column("File Name", style="magenta", overflow="fold")
     table.add_column("Original Size", justify="right")
     table.add_column("Encoded Size", justify="right")
     table.add_column("Ratio", justify="right")
