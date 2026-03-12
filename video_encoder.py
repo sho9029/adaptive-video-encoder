@@ -381,8 +381,12 @@ def run_encode_with_retry(
     Returns: (success_bool, final_attempt_count)
     """
     current_quality = args.quality
-    history = []  # (quality_used, ssim_result) の履歴リスト
-    
+    history = []  # (quality_used, score) の履歴リスト
+    metric_name = args.metric.upper()
+    best_score = -1.0
+    best_q = current_quality
+    tried_q_values = {current_quality}
+
     for attempt in range(args.max_retries + 1):
         success = encode_video(
             source_file,
@@ -464,6 +468,7 @@ def run_encode_with_retry(
         score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h, args.vmaf_hwaccel)
         history.append((current_quality, score))
 
+
         # サイズチェック（早期終了の判断材料）
         try:
             src_size = source_file.stat().st_size
@@ -471,117 +476,123 @@ def run_encode_with_retry(
         except Exception:
             src_size = tgt_size = 0
 
-        metric_name = args.metric.upper()
+        # スコアの状態判定
+        is_low = score < args.min_score
+        is_high = score > args.max_score
 
-        if score < args.min_score:
-            if attempt < args.max_retries:
-                if tgt_size > src_size and src_size > 0:
-                    logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], stopping adjustment)")
-                    logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
-                    
-                    # 元ファイルに処理済みタグを付与
-                    tag_cmd = [
-                        'ffmpeg', '-y', '-i', str(source_file),
-                        '-c', 'copy', '-map', '0',
-                        '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
-                        '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
-                    ]
-                    # mp4/mov等の場合は上書きが直接できないため一時ファイルを経由する
-                    target_ext = source_file.suffix.lower()
-                    if target_ext in ['.mp4', '.mov', '.m4v']:
-                        tmp_src = source_file.with_name(f".tmp.tag_{source_file.name}")
-                        tag_cmd.append(str(tmp_src))
-                        try:
-                            subprocess.run(tag_cmd, capture_output=True, check=True)
-                            if tmp_src.exists():
-                                shutil.move(str(tmp_src), str(source_file))
-                        except Exception as e:
-                            logger.debug(f"Failed to tag original file: {e}")
-                            if tmp_src.exists():
-                                tmp_src.unlink()
-                    else:
-                        pass
+        # 目標に最も近いスコアを記録
+        # スコア不足時は「最大値」、スコア超過時は「最小値」が目標に近い
+        if is_low:
+            if best_score == -1.0 or score > best_score:
+                best_score = score
+                best_q = current_quality
+        elif is_high:
+            if best_score == -1.0 or score < best_score:
+                best_score = score
+                best_q = current_quality
 
-                    logger.info(f"  [yellow]Reverted to original file[/yellow]")
-                    # サイズも超え、画質も足りない最悪な状態。これ以上のサイズ増加は無意味なのでここで打ち切り、失敗扱いとする。
-                    summary_data.append({
-                        'name': source_file.name,
-                        'original_size': src_size,
-                        'encoded_size': None,
-                        'status': f'Failed ({metric_name} {score:.3f} < {args.min_score})'
-                    })
-                    if encode_target_file.exists():
-                        encode_target_file.unlink()
-                    return False, attempt
-                
-                # --- 非線形画質調整 (Secant / P制御) ---
-                target_score = args.min_score + (0.002 if args.metric == 'ssim' else 0.5)
-                if len(history) >= 2:
-                    q1, s1 = history[-2]
-                    q2, s2 = history[-1]
-                    if s2 == s1: # スコアが全く変化しなかった場合の保護
-                        delta_q = -1.0
-                    else:
-                        slope = (q2 - q1) / (s2 - s1)
-                        delta_q = slope * (target_score - s2)
-                else:
-                    # 履歴が1つしかない場合はP制御で推測
-                    p_gain = -200.0 if args.metric == 'ssim' else -2.0
-                    delta_q = p_gain * (target_score - score)
-                
-                # 極端な変動を防ぐためのクリッピング（±6）
-                delta_q = max(-6.0, min(6.0, delta_q))
-                next_q = round(current_quality + delta_q)
-                
-                # 最低でも1ステップは動かす
-                if next_q == current_quality:
-                    next_q -= 1
-                
-                next_q = max(0, next_q) # 負のQ値は避ける
-                logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
-                current_quality = next_q
-            else:
-                logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red] after {args.max_retries} retries. Target minimum {metric_name} not reached.)")
+        if attempt >= args.max_retries:
+            if is_low:
+                logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red] after {args.max_retries} retries. Best: [cyan]{best_score:.5f}[/cyan] at Q:[cyan]{best_q}[/cyan])")
+
                 summary_data.append({
                     'name': source_file.name,
                     'original_size': src_size,
                     'encoded_size': None,
                     'status': f'Failed ({metric_name} Limit)'
                 })
-                # 目標画質に達しなかったので結果を破棄（一時ファイルを削除）
                 if encode_target_file.exists():
                     encode_target_file.unlink()
                 return False, attempt
-        elif score > args.max_score:
-            if attempt < args.max_retries:
-                # --- 非線形画質調整 (Secant / P制御) ---
-                target_score = args.max_score - (0.002 if args.metric == 'ssim' else 0.5)
-                if len(history) >= 2:
-                    q1, s1 = history[-2]
-                    q2, s2 = history[-1]
-                    if s2 == s1:
-                        delta_q = 1.0
-                    else:
-                        slope = (q2 - q1) / (s2 - s1)
-                        delta_q = slope * (target_score - s2)
-                else:
-                    p_gain = -200.0 if args.metric == 'ssim' else -2.0
-                    delta_q = p_gain * (target_score - score)
-                
-                delta_q = max(-6.0, min(6.0, delta_q))
-                next_q = round(current_quality + delta_q)
-                
-                if next_q == current_quality:
-                    next_q += 1
-                
-                logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([yellow]Exceeds {args.max_score}[/yellow], Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
-                current_quality = next_q
             else:
                 logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([yellow]Still exceeds upper limit[/yellow] after {args.max_retries} retries. Keeping this attempt as success.)")
                 break
+
+        # サイズ超過時の早期打ち切り（スコア不足時のみ）
+        if is_low and tgt_size > src_size and src_size > 0:
+            logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], stopping adjustment)")
+            logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
+            
+            # 元ファイルに処理済みタグを付与
+            tag_cmd = [
+                'ffmpeg', '-y', '-i', str(source_file),
+                '-c', 'copy', '-map', '0',
+                '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
+                '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
+            ]
+            target_ext = source_file.suffix.lower()
+            if target_ext in ['.mp4', '.mov', '.m4v']:
+                tmp_src = source_file.with_name(f".tmp.tag_{source_file.name}")
+                tag_cmd.append(str(tmp_src))
+                try:
+                    subprocess.run(tag_cmd, capture_output=True, check=True)
+                    if tmp_src.exists():
+                        shutil.move(str(tmp_src), str(source_file))
+                except Exception as e:
+                    logger.debug(f"Failed to tag original file: {e}")
+                    if tmp_src.exists():
+                        tmp_src.unlink()
+
+            logger.info(f"  [yellow]Reverted to original file[/yellow]")
+            summary_data.append({
+                'name': source_file.name,
+                'original_size': src_size,
+                'encoded_size': None,
+                'status': f'Failed ({metric_name} {score:.3f} < {args.min_score})'
+            })
+            if encode_target_file.exists():
+                encode_target_file.unlink()
+            return False, attempt
+
+        # --- 品質調整ロジック (対称的な探索) ---
+        target_score = (args.min_score + 0.5) if is_low else (args.max_score - 0.5)
+        # 評価指標による補正 (SSIMなら 0.5 -> 0.002)
+        if args.metric == 'ssim':
+            target_score = (args.min_score + 0.002) if is_low else (args.max_score - 0.002)
+
+        if len(history) >= 2:
+            q1, s1 = history[-2]
+            q2, s2 = history[-1]
+            if s2 == s1:
+                delta_q = -1.0 if is_low else 1.0
+            else:
+                slope = (q2 - q1) / (s2 - s1)
+                delta_q = slope * (target_score - s2)
+                
+                # 逆転現象検知 (物理的矛盾時のフォールバック)
+                if slope > 0:
+                    logger.debug(f"  Non-monotonicity detected (slope: {slope:.5f}).")
+                    delta_q = -1.0 if is_low else 1.0
         else:
-            logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([green]Passed[/green])")
+            p_gain = -200.0 if args.metric == 'ssim' else -2.0
+            delta_q = p_gain * (target_score - score)
+        
+        # クリッピングと単調性の制約
+        delta_q = max(-6.0, min(6.0, delta_q))
+        if is_low and delta_q > 0: delta_q = -1.0
+        if is_high and delta_q < 0: delta_q = 1.0
+        
+        next_q = round(current_quality + delta_q)
+        
+        # 最低1ステップは期待される方向へ移動させる
+        if is_low and next_q >= current_quality: next_q = current_quality - 1
+        if is_high and next_q <= current_quality: next_q = current_quality + 1
+        
+        # 試行済みQ値を回避 (目標方向へ向かってスキップ)
+        while next_q in tried_q_values:
+            next_q += (-1 if is_low else 1)
+            if next_q < 0: break
+        
+        if next_q < 0 or next_q in tried_q_values:
+            reason = "no more Q values" if next_q >= 0 else "hit Q=0 limit"
+            logger.warning(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ([red]Failed[/red], {reason}. Best: [cyan]{best_score:.5f}[/cyan] at Q:[cyan]{best_q}[/cyan])")
             break
+
+        status_msg = f"[red]Failed[/red]" if is_low else f"[yellow]Exceeds {args.max_score}[/yellow]"
+        logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan] ({status_msg}, Adjusting Q: [cyan]{current_quality}[/cyan] -> [cyan]{next_q}[/cyan]...)")
+        
+        current_quality = next_q
+        tried_q_values.add(current_quality)
 
     return True, attempt
 
