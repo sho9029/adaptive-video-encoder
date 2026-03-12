@@ -245,7 +245,7 @@ def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: i
             'ffmpeg',
             '-hwaccel', 'cuda', '-threads', '8', '-i', str(encoded_path),
             '-hwaccel', 'cuda', '-threads', '8', '-i', str(original_path),
-            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,hwupload_cuda[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
+            '-filter_complex', f'[0:v]hwupload_cuda,scale_cuda={src_w}:{src_h},settb=1/AVTB,setpts=PTS-STARTPTS[main];[1:v]hwupload_cuda,scale_cuda={src_w}:{src_h},settb=1/AVTB,setpts=PTS-STARTPTS[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
             '-f', 'null',
             '-'
         ]
@@ -254,7 +254,7 @@ def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: i
             'ffmpeg',
             '-i', str(encoded_path),
             '-i', str(original_path),
-            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS[ref];[main][ref]libvmaf=model=version={model_name}',
+            '-filter_complex', f'[0:v]scale={src_w}:{src_h},format=yuv420p,settb=1/AVTB,setpts=PTS-STARTPTS[main];[1:v]scale={src_w}:{src_h},format=yuv420p,settb=1/AVTB,setpts=PTS-STARTPTS[ref];[main][ref]libvmaf=model=version={model_name}',
             '-f', 'null',
             '-'
         ]
