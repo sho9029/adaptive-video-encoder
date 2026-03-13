@@ -7,6 +7,7 @@ import shutil
 import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from win32_setctime import setctime
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -141,6 +142,22 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         logger.debug(f"Failed to decode ffprobe output for {file_path}")
         return None
+
+def preserve_timestamps(src: Path, dst: Path):
+    """
+    ソースファイルからターゲットファイルへ作成日時、更新日時、アクセス日時をコピーする。
+    """
+    try:
+        # 更新日時、アクセス日時をコピー
+        shutil.copystat(src, dst)
+        
+        # 作成日時をコピー (Windows環境用)
+        creation_time = os.path.getctime(src)
+        setctime(str(dst), creation_time)
+        
+        logger.debug(f"  Preserved timestamps from {src.name} to {dst.name}")
+    except Exception as e:
+        logger.warning(f"  Failed to preserve timestamps: {e}")
 
 def get_video_rotation(stream: dict) -> int:
     """
@@ -742,6 +759,10 @@ def process_file(
         source_file, encode_target_file, target_file, target_root, rel_path,
         attempt, in_place, summary_data
     )
+
+    # タイムスタンプの維持 (出力ファイルが正常に作成されている場合のみ)
+    if target_file.exists():
+        preserve_timestamps(source_file, target_file)
 
     return True
 
