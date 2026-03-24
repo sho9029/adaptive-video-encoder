@@ -251,52 +251,78 @@ def check_cuda_vmaf_support() -> bool:
 def calculate_vmaf(original_path: Path, encoded_path: Path, src_w: int, src_h: int, use_hwaccel: bool = False) -> float:
     """
     ffmpegを使用して2つの動画ファイル間のVMAFを計算する。
-    動画の総画素数に基づき、1080p相当以下なら標準モデル、それ以上なら4K専用モデルに切り替える。
-    use_hwaccelがTrueならハードウェアアクセラレーション（CUDA）を使用するが、これにはカスタムビルド版のFFmpeg（libvmaf_cuda対応）が必要。
-    Falseの場合は一般的なFFmpeg（libvmaf有効化版）でCPUを用いて計算する。
+    CUDA環境での計算を優先し、失敗した場合は順次別方式へ切り替える。
     """
+    # 動画の解像度に応じてモデルを選択する
+    # FHD(1920x1080)を超える場合は4Kモデル、それ以下は標準モデルを使用
     pixel_area = src_w * src_h
     model_name = 'vmaf_4k_v0.6.1neg' if pixel_area > 1920 * 1080 else 'vmaf_v0.6.1neg'
 
     if use_hwaccel:
-        cmd = [
-            'ffmpeg',
-            '-hwaccel', 'cuda', '-threads', '8', '-i', str(encoded_path),
-            '-hwaccel', 'cuda', '-threads', '8', '-i', str(original_path),
-            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,hwupload_cuda,scale_cuda={src_w}:{src_h}:format=nv12[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,hwupload_cuda,scale_cuda={src_w}:{src_h}:format=nv12[ref];[main][ref]libvmaf_cuda=model=version={model_name}',
-            '-f', 'null',
-            '-'
-        ]
-    else:
-        cmd = [
+        # GPUメモリ内での計算
+        try:
+            result = subprocess.run([
+                'ffmpeg',
+                '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-i', str(encoded_path),
+                '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-i', str(original_path),
+                '-filter_complex', (
+                    f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,scale_cuda=format=yuv420p[main];'
+                    f'[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,scale_cuda=format=yuv420p[ref];'
+                    f'[main][ref]libvmaf_cuda=model=version={model_name}'
+                ),
+                '-f', 'null', '-'
+            ], capture_output=True, text=True)
+            if result.returncode == 0:
+                match = re.search(r'VMAF score: ([0-9.]+)', result.stderr)
+                if match:
+                    return float(match.group(1))
+        except Exception:
+            pass
+        
+        # CPUでピクセルフォーマット等を正規化してからGPUへ転送して計算
+        try:
+            result = subprocess.run([
+                'ffmpeg',
+                '-hwaccel', 'cuda', '-i', str(encoded_path),
+                '-hwaccel', 'cuda', '-i', str(original_path),
+                '-filter_complex', (
+                    f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,setsar=1,'
+                    f'format=yuv420p,hwupload_cuda,scale_cuda=format=yuv420p[main];'
+                    f'[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,setsar=1,'
+                    f'format=yuv420p,hwupload_cuda,scale_cuda=format=yuv420p[ref];'
+                    f'[main][ref]libvmaf_cuda=model=version={model_name}'
+                ),
+                '-f', 'null', '-'
+            ], capture_output=True, text=True)
+            if result.returncode == 0:
+                match = re.search(r'VMAF score: ([0-9.]+)', result.stderr)
+                if match:
+                    return float(match.group(1))
+        except Exception:
+            pass
+
+    # CPUによる最終的な計算
+    try:
+        result = subprocess.run([
             'ffmpeg',
             '-i', str(encoded_path),
             '-i', str(original_path),
-            '-filter_complex', f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,scale={src_w}:{src_h},format=yuv420p[main];[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,scale={src_w}:{src_h},format=yuv420p[ref];[main][ref]libvmaf=model=version={model_name}',
-            '-f', 'null',
-            '-'
-        ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+            '-filter_complex', (
+                f'[0:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,scale={src_w}:{src_h},format=yuv420p[main];'
+                f'[1:v]settb=1/AVTB,setpts=PTS-STARTPTS,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,scale={src_w}:{src_h},format=yuv420p[ref];'
+                f'[main][ref]libvmaf=model=version={model_name}'
+            ),
+            '-f', 'null', '-'
+        ], capture_output=True, text=True)
         
-        if result.returncode != 0:
-            logger.error(f"  ffmpeg VMAF calculation failed for {encoded_path.name}")
-            logger.error(f"  ffmpeg stderr: {result.stderr}")
-            return 0.0
-            
-        output = result.stderr
-        match = re.search(r'VMAF score: ([0-9.]+)', output)
-        if match:
-            return float(match.group(1))
-        else:
-            logger.warning(f"  Could not parse VMAF from output")
-            logger.warning(f"  ffmpeg output: {output}")
-            return 0.0
-            
-    except Exception as e:
-        logger.error(f"  Error calculating VMAF: {e}")
-        return 0.0
+        if result.returncode == 0:
+            match = re.search(r'VMAF score: ([0-9.]+)', result.stderr)
+            if match:
+                return float(match.group(1))
+    except Exception:
+        pass
+    
+    return 0.0
 
 def encode_video(
     input_path: Path,
@@ -485,6 +511,7 @@ def run_encode_with_retry(
         # スコアチェック
         score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h, args.vmaf_hwaccel)
         history.append((current_quality, score))
+        logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan]")
 
 
         # サイズチェック（早期終了の判断材料）
