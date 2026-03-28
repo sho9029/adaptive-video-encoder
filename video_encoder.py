@@ -525,6 +525,10 @@ def run_encode_with_retry(
         is_low = score < args.min_score
         is_high = score > args.max_score
 
+        # スコアが目標範囲内ならループ終了
+        if not is_low and not is_high:
+            break
+
         # 目標に最も近いスコアを記録
         # スコア不足時は「最大値」、スコア超過時は「最小値」が目標に近い
         if is_low:
