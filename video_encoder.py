@@ -350,6 +350,10 @@ def encode_video(
         '-c:v', codec,
     ]
 
+    cmd.extend(['-c:a', audio_codec])
+    if audio_bitrate and audio_codec != 'copy':
+        cmd.extend(['-b:a', audio_bitrate])
+
     # コーデックごとの画質オプション設定
     if codec in ['av1_nvenc', 'hevc_nvenc']:
         cmd.extend(['-cq:v', str(quality_value)])
