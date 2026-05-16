@@ -347,7 +347,13 @@ def encode_video(
         'ffmpeg',
         '-y', # 上書き許可
         '-i', str(input_path),
-        '-c:v', codec,
+        # 映像（サムネイル含む）と音声をすべてマップ
+        '-map', '0:v',
+        '-map', '0:a?',
+        # 基本の映像コーデックをコピー（サムネイル画像等を維持するため）
+        '-c:v', 'copy',
+        # メイン映像ストリーム（0番目）のみ指定コーデックでエンコード
+        '-c:v:0', codec,
     ]
 
     cmd.extend(['-c:a', audio_codec])
@@ -356,19 +362,19 @@ def encode_video(
 
     # コーデックごとの画質オプション設定
     if codec in ['av1_nvenc', 'hevc_nvenc']:
-        cmd.extend(['-cq:v', str(quality_value)])
+        cmd.extend(['-cq:v:0', str(quality_value)])
         # NVENC向けの最適化設定
-        cmd.extend(['-tune', 'hq', '-rc-lookahead', '60', '-pix_fmt', 'yuv420p'])
+        cmd.extend(['-tune:v:0', 'hq', '-rc-lookahead:v:0', '60', '-pix_fmt:v:0', 'yuv420p'])
     elif codec in ['libx264', 'libx265']:
-        cmd.extend(['-crf', str(quality_value)])
+        cmd.extend(['-crf:v:0', str(quality_value)])
     
     # プリセット
-    cmd.extend(['-preset', preset])
+    cmd.extend(['-preset:v:0', preset])
 
     # メタデータ転送とMP4最適化、エンコーダー識別タグの追加
     cmd.extend(['-map_metadata', '0', '-movflags', '+faststart'])
     # autorotateで物理回転済みのため、rotateタグを明示的に除去（二重回転防止）
-    cmd.extend(['-metadata:s:v', 'rotate='])
+    cmd.extend(['-metadata:s:v:0', 'rotate='])
     # MP4コンテナの互換性を考慮し、comment タグにも情報を埋め込む
     cmd.extend(['-metadata', f'encoder_tool={ENCODER_TOOL_NAME}'])
     cmd.extend(['-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'])
