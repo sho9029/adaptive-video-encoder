@@ -766,8 +766,8 @@ def process_file(
     # コンテナをmp4に変更
     target_file = target_root / rel_path.with_suffix('.mp4')
 
-    # 同一ファイル上書き（In-place）かどうかの判定
-    in_place = source_file.resolve() == target_file.resolve()
+    # 同一ディレクトリへの出力（In-place）かどうかの判定
+    in_place = source_root.resolve() == target_root.resolve()
     
     # ffmpegの出力先ファイルパスを設定（上書きの場合は一時ファイルを使用）
     encode_target_file = target_file.with_name(f".tmp.{target_file.name}") if in_place else target_file
