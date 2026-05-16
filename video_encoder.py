@@ -992,11 +992,14 @@ def main():
     logger.debug(f"Scanning files in {args.source_dir}...")
     all_files = sorted([p for p in args.source_dir.rglob('*') if p.is_file()])
     
+    # プログレスバー等の表示用に、動画の可能性があるファイルを抽出
+    video_files = [p for p in all_files if p.suffix.lower() in VIDEO_EXTENSIONS]
+    
     hwaccel_str = "(CUDA)" if args.vmaf_hwaccel else "(CPU)"
     vmaf_info = f", VMAF_Mode={hwaccel_str}" if args.metric == 'vmaf' else ""
     
     # ファイルごとに動画判定を行いながら順次処理
-    logger.info(f"Found {len(all_files)} files in {args.source_dir}")
+    logger.info(f"Found {len(video_files)} video files in {args.source_dir}")
     logger.info(f"Settings: Codec={args.codec}, Quality={args.quality}, Preset={args.preset}, Metric={args.metric.upper()}{vmaf_info}, MinScore={args.min_score}, MaxScore={args.max_score}\n")
 
     summary_data = []
@@ -1016,43 +1019,38 @@ def main():
     )
     
     with progress_ui as progress:
-        task_id = progress.add_task("[cyan]Processing Files...", total=len(all_files))
+        task_id = progress.add_task("[cyan]Processing Video Files...", total=len(video_files))
         
-        for i, file_path in enumerate(all_files):
-            progress.update(task_id, description=f"[cyan]Processing: [bold]{file_path.name}[/bold]")
-            
+        video_index = 0
+        for file_path in all_files:
             if file_path.name.startswith('.'):
-                progress.advance(task_id)
                 continue
+            
+            is_potential_video = file_path.suffix.lower() in VIDEO_EXTENSIONS
+            
+            if is_potential_video:
+                progress.update(task_id, description=f"[cyan]Processing: [bold]{file_path.name}[/bold]")
 
             if is_video_file(file_path):
-                # logger.info を使って Progress と連携した出力を行う
-                logger.info(f"Processing \\[[yellow]{i+1}/{len(all_files)}[/yellow]]: [cyan]{file_path.name}[/cyan]")
+                video_index += 1
+                logger.info(f"Processing \\[[yellow]{video_index}/{len(video_files)}[/yellow]]: [cyan]{file_path.name}[/cyan]")
                 process_file(file_path, args.source_dir, args.target_dir, args, summary_data)
+                progress.advance(task_id)
             else:
+                # 動画以外のファイル、または動画判定に失敗したファイルの処理（ファイルの操作自体は維持）
                 rel_path = file_path.relative_to(args.source_dir)
                 target_file = args.target_dir / rel_path
                 target_file.parent.mkdir(parents=True, exist_ok=True)
                 
-                logger.info(f"Processing \\[[yellow]{i+1}/{len(all_files)}[/yellow]]: [cyan]{file_path.name}[/cyan] (Non-video)")
-                
-                if file_path.resolve() == target_file.resolve():
-                    summary_data.append({
-                        'name': file_path.name,
-                        'original_size': file_path.stat().st_size,
-                        'encoded_size': None,
-                        'status': 'Skipped (In-place non-video)'
-                    })
-                else:
-                    summary_data.append({
-                        'name': file_path.name,
-                        'original_size': file_path.stat().st_size,
-                        'encoded_size': None,
-                        'status': 'Copied (Non-video)'
-                    })
+                if file_path.resolve() != target_file.resolve():
                     shutil.copy2(file_path, target_file)
-            
-            progress.advance(task_id)
+                
+                # サマリーへの記録やログ表示は行わない（表示だけ変えるため）
+                
+                # 動画拡張子だったが動画として扱えなかった場合は進捗を進める
+                if is_potential_video:
+                    video_index += 1
+                    progress.advance(task_id)
 
     # 結果サマリーの表示
     print_summary_table(summary_data)
@@ -1086,13 +1084,9 @@ def print_summary_table(summary_data: list) -> None:
             skipped_files += 1
             if item['original_size'] is not None:
                 total_encoded_size += item['original_size']
-                
-        # Non-video copy
-        if not item['status'].startswith('Success') and item['original_size'] is not None:
-            total_encoded_size += item['original_size']
 
     success_count = sum(1 for d in summary_data if 'Success' in d['status'])
-    skip_copy_count = sum(1 for d in summary_data if 'Skipped' in d['status'] or 'Copied' in d['status'])
+    skip_copy_count = sum(1 for d in summary_data if 'Skipped' in d['status'])
     fail_count = sum(1 for d in summary_data if 'Failed' in d['status'])
 
     console.print("\n")
@@ -1102,7 +1096,7 @@ def print_summary_table(summary_data: list) -> None:
         f"[bold]Encoding Summary[/bold]\n"
         f" Total Files: {total_files} | "
         f"[green]Success: {success_count}[/green] | "
-        f"[yellow]Skipped/Copied: {skip_copy_count}[/yellow] | "
+        f"[yellow]Skipped: {skip_copy_count}[/yellow] | "
         f"[red]Failed: {fail_count}[/red]"
     )
     console.print(summary_text)
@@ -1153,7 +1147,7 @@ def print_summary_table(summary_data: list) -> None:
             status_styled = f"[red]{status}[/red]"
         elif "Reverted" in status:
             status_styled = f"[yellow]{status}[/yellow]"
-        elif "Skipped" in status or "Copied" in status:
+        elif "Skipped" in status:
             status_styled = f"[dim]{status}[/dim]"
             
         table.add_row(name, orig_str, enc_str, ratio_str, status_styled)
