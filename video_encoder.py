@@ -6,6 +6,7 @@ import logging
 import sys
 import shutil
 import re
+import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from win32_setctime import setctime
@@ -420,6 +421,32 @@ def determine_audio_settings(source_info: dict) -> tuple[str, Optional[str]]:
 
     return audio_codec, audio_bitrate
 
+
+def tag_processed_file(file_path: Path, remux_extensions: set[str]) -> None:
+    """
+    ファイルに処理済みタグを付与する。
+
+    FFmpegの出力先は対象ファイルと同じディレクトリ内に作成した
+    ランダム名の一時ディレクトリ配下に置く。攻撃者が予測可能な一時
+    ファイルをシンボリックリンクとして事前作成しても、FFmpegがその
+    リンク先を上書きしないようにする。
+    """
+    if file_path.suffix.lower() not in remux_extensions:
+        return
+
+    with tempfile.TemporaryDirectory(prefix=".tmp.tag_", dir=file_path.parent) as tmp_dir:
+        tmp_path = Path(tmp_dir) / file_path.name
+        tag_cmd = [
+            'ffmpeg', '-y', '-i', str(file_path),
+            '-c', 'copy', '-map', '0',
+            '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
+            '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}',
+            str(tmp_path)
+        ]
+        subprocess.run(tag_cmd, capture_output=True, check=True)
+        if tmp_path.exists():
+            shutil.move(str(tmp_path), str(file_path))
+
 def run_encode_with_retry(
     source_file: Path,
     encode_target_file: Path,
@@ -573,24 +600,10 @@ def run_encode_with_retry(
             logger.warning(f"  [yellow]Encoded file is larger than original ({tgt_size} > {src_size}). Reverting to original file.[/yellow]")
             
             # 元ファイルに処理済みタグを付与
-            tag_cmd = [
-                'ffmpeg', '-y', '-i', str(source_file),
-                '-c', 'copy', '-map', '0',
-                '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
-                '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
-            ]
-            target_ext = source_file.suffix.lower()
-            if target_ext in ['.mp4', '.mov', '.m4v']:
-                tmp_src = source_file.with_name(f".tmp.tag_{source_file.name}")
-                tag_cmd.append(str(tmp_src))
-                try:
-                    subprocess.run(tag_cmd, capture_output=True, check=True)
-                    if tmp_src.exists():
-                        shutil.move(str(tmp_src), str(source_file))
-                except Exception as e:
-                    logger.debug(f"Failed to tag original file: {e}")
-                    if tmp_src.exists():
-                        tmp_src.unlink()
+            try:
+                tag_processed_file(source_file, {'.mp4', '.mov', '.m4v'})
+            except Exception as e:
+                logger.debug(f"Failed to tag original file: {e}")
 
             logger.info(f"  [yellow]Reverted to original file[/yellow]")
             summary_data.append({
@@ -690,25 +703,10 @@ def finalize_encoded_file(
                 target_to_tag = source_file
 
             # 元ファイル（またはコピー先）に処理済みタグを付与
-            tag_cmd = [
-                'ffmpeg', '-y', '-i', str(target_to_tag),
-                '-c', 'copy', '-map', '0',
-                '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
-                '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}'
-            ]
-            
-            target_ext = target_to_tag.suffix.lower()
-            if target_ext in ['.mp4', '.mov', '.m4v', '.mkv', '.webm']:
-                tmp_src = target_to_tag.with_name(f".tmp.tag_{target_to_tag.name}")
-                tag_cmd.append(str(tmp_src))
-                try:
-                    subprocess.run(tag_cmd, capture_output=True, check=True)
-                    if tmp_src.exists():
-                        shutil.move(str(tmp_src), str(target_to_tag))
-                except Exception as e:
-                    logger.debug(f"Failed to tag original file: {e}")
-                    if tmp_src.exists():
-                        tmp_src.unlink()
+            try:
+                tag_processed_file(target_to_tag, {'.mp4', '.mov', '.m4v', '.mkv', '.webm'})
+            except Exception as e:
+                logger.debug(f"Failed to tag original file: {e}")
             
             logger.info(f"  [yellow]Reverted to original file[/yellow]")
             tgt_size = target_to_tag.stat().st_size # タグ付与後のサイズを取得
