@@ -236,13 +236,28 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
         logger.error(f"  Error calculating SSIM: {e}")
         return 0.0
 
-def check_cuda_vmaf_support() -> bool:
+def resolve_ffmpeg_path() -> Optional[Path]:
+    """
+    ffmpegの実行ファイルを絶対パスとして解決する。
+    """
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        return None
+
+    resolved_path = Path(ffmpeg_path).resolve()
+    if not resolved_path.is_file():
+        return None
+
+    return resolved_path
+
+
+def check_cuda_vmaf_support(ffmpeg_path: Path) -> bool:
     """
     ffmpegが libvmaf_cuda フィルタをサポートしているか判定する。
     """
     try:
         result = subprocess.run(
-            ['ffmpeg', '-filters'],
+            [str(ffmpeg_path), '-filters'],
             capture_output=True, text=True
         )
         return 'libvmaf_cuda' in result.stdout
@@ -969,7 +984,11 @@ def main():
     # VMAFのハードウェアサポート自動判定
     args.vmaf_hwaccel = False
     if args.metric == 'vmaf':
-        args.vmaf_hwaccel = check_cuda_vmaf_support()
+        ffmpeg_path = resolve_ffmpeg_path()
+        if ffmpeg_path is None:
+            logger.warning("ffmpeg not found. Falling back to CPU VMAF mode.")
+        else:
+            args.vmaf_hwaccel = check_cuda_vmaf_support(ffmpeg_path)
 
     # デフォルト値の設定（共通ロジック）
     # コーデックごとのデフォルト設定を取得
