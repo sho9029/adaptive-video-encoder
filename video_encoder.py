@@ -236,25 +236,29 @@ def calculate_ssim(original_path: Path, encoded_path: Path) -> float:
         logger.error(f"  Error calculating SSIM: {e}")
         return 0.0
 
-def resolve_ffmpeg_path(ffmpeg_path: Path) -> Optional[Path]:
+def resolve_ffmpeg_path() -> Optional[Path]:
     """
-    ユーザーが指定したffmpegの実行ファイルを絶対パスとして解決する。
+    ffmpegの実行ファイルを絶対パスとして解決する。
     """
-    expanded_path = ffmpeg_path.expanduser()
-    if not expanded_path.is_absolute():
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
         return None
 
-    resolved_path = expanded_path.resolve()
+    resolved_path = Path(ffmpeg_path).resolve()
     if not resolved_path.is_file():
         return None
 
     return resolved_path
 
 
-def check_cuda_vmaf_support(ffmpeg_path: Path) -> bool:
+def check_cuda_vmaf_support() -> bool:
     """
     ffmpegが libvmaf_cuda フィルタをサポートしているか判定する。
     """
+    ffmpeg_path = resolve_ffmpeg_path()
+    if ffmpeg_path is None:
+        return False
+
     try:
         result = subprocess.run(
             [str(ffmpeg_path), '-filters'],
@@ -561,7 +565,12 @@ def run_encode_with_retry(
             return False, attempt
 
         # スコアチェック
-        score = calculate_ssim(source_file, encode_target_file) if args.metric == 'ssim' else calculate_vmaf(source_file, encode_target_file, src_w, src_h, args.vmaf_hwaccel)
+        if args.metric == 'ssim':
+            score = calculate_ssim(source_file, encode_target_file)
+        else:
+            if args.vmaf_hwaccel is None:
+                args.vmaf_hwaccel = check_cuda_vmaf_support()
+            score = calculate_vmaf(source_file, encode_target_file, src_w, src_h, args.vmaf_hwaccel)
         history.append((current_quality, score))
         logger.info(f"  {metric_name}: [cyan]{score:.5f}[/cyan]")
 
@@ -934,7 +943,6 @@ def parse_arguments() -> argparse.Namespace:
             max_retries=max_retries,
 
             force=force,
-            ffmpeg_path=None,
             check=None
         )
     else:
@@ -955,7 +963,6 @@ def parse_arguments() -> argparse.Namespace:
         
         parser.add_argument('--preset', type=str, help='Encoding preset. Default depends on codec.')
         
-        parser.add_argument('--ffmpeg-path', type=Path, help='Absolute path to ffmpeg for CUDA VMAF auto-detection')
         parser.add_argument('--metric', type=str, default=DEFAULT_METRIC, choices=['ssim', 'vmaf'], help=f'Quality metric (default: {DEFAULT_METRIC})')
         parser.add_argument('--min-score', type=float, help='Minimum score threshold (default: depends on metric)')
         parser.add_argument('--max-score', type=float, help='Maximum score threshold (default: depends on metric)')
@@ -983,17 +990,8 @@ def main():
         check_encoded_status(args.check)
         return
 
-    # VMAFのハードウェアサポート自動判定
-    args.vmaf_hwaccel = False
-    if args.metric == 'vmaf':
-        if args.ffmpeg_path is None:
-            logger.info("Skipping CUDA VMAF auto-detection because --ffmpeg-path was not provided. Using CPU VMAF mode.")
-        else:
-            ffmpeg_path = resolve_ffmpeg_path(args.ffmpeg_path)
-            if ffmpeg_path is None:
-                logger.warning("Invalid --ffmpeg-path. Falling back to CPU VMAF mode.")
-            else:
-                args.vmaf_hwaccel = check_cuda_vmaf_support(ffmpeg_path)
+    # VMAFのハードウェアサポートは、実際にVMAF計算が必要になった時点で判定する。
+    args.vmaf_hwaccel = None if args.metric == 'vmaf' else False
 
     # デフォルト値の設定（共通ロジック）
     # コーデックごとのデフォルト設定を取得
@@ -1028,7 +1026,7 @@ def main():
     # プログレスバー等の表示用に、動画の可能性があるファイルを抽出
     video_files = [p for p in all_files if p.suffix.lower() in VIDEO_EXTENSIONS]
     
-    hwaccel_str = "(CUDA)" if args.vmaf_hwaccel else "(CPU)"
+    hwaccel_str = "(Auto)" if args.vmaf_hwaccel is None else ("(CUDA)" if args.vmaf_hwaccel else "(CPU)")
     vmaf_info = f", VMAF_Mode={hwaccel_str}" if args.metric == 'vmaf' else ""
     
     # ファイルごとに動画判定を行いながら順次処理
