@@ -718,7 +718,8 @@ def finalize_encoded_file(
             if in_place:
                 try:
                     import send2trash
-                    send2trash.send2trash(str(source_file.resolve()))
+                    # symlink のリンク先ではなく、ソースツリー内のパス自体を退避する。
+                    send2trash.send2trash(str(source_file))
                 except ImportError:
                     source_file.unlink()
                 except Exception as e:
