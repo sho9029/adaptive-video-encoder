@@ -909,7 +909,7 @@ def parse_arguments() -> argparse.Namespace:
             max_retries=max_retries,
 
             force=force,
-            vmaf_hwaccel=False,
+            vmaf_hwaccel=True,
             check=None
         )
     else:
@@ -930,7 +930,8 @@ def parse_arguments() -> argparse.Namespace:
         
         parser.add_argument('--preset', type=str, help='Encoding preset. Default depends on codec.')
         
-        parser.add_argument('--vmaf-hwaccel', action='store_true', help='Use CUDA acceleration for VMAF calculation')
+        parser.add_argument('--no-vmaf-hwaccel', dest='vmaf_hwaccel', action='store_false', default=True,
+                            help='Disable CUDA acceleration for VMAF calculation')
         parser.add_argument('--metric', type=str, default=DEFAULT_METRIC, choices=['ssim', 'vmaf'], help=f'Quality metric (default: {DEFAULT_METRIC})')
         parser.add_argument('--min-score', type=float, help='Minimum score threshold (default: depends on metric)')
         parser.add_argument('--max-score', type=float, help='Maximum score threshold (default: depends on metric)')
