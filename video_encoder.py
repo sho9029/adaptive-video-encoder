@@ -422,30 +422,45 @@ def determine_audio_settings(source_info: dict) -> tuple[str, Optional[str]]:
     return audio_codec, audio_bitrate
 
 
+def make_temp_output_path(target_file: Path, prefix: str) -> Path:
+    """FFmpeg出力用の一時ファイルを同じ親ディレクトリ内に安全に作成する。"""
+    with tempfile.NamedTemporaryFile(
+        prefix=prefix,
+        suffix=target_file.suffix,
+        dir=target_file.parent,
+        delete=False
+    ) as tmp_file:
+        return Path(tmp_file.name)
+
+
 def tag_processed_file(file_path: Path, remux_extensions: set[str]) -> None:
     """
     ファイルに処理済みタグを付与する。
 
-    FFmpegの出力先は対象ファイルと同じディレクトリ内に作成した
-    ランダム名の一時ディレクトリ配下に置く。攻撃者が予測可能な一時
-    ファイルをシンボリックリンクとして事前作成しても、FFmpegがその
-    リンク先を上書きしないようにする。
+    FFmpegの出力先は対象ファイルと同じディレクトリ内に安全に作成した
+    ランダム名の一時ファイルにする。攻撃者が予測可能な一時ファイル名を
+    シンボリックリンクとして事前作成しても、FFmpegがそのリンク先を
+    上書きしないようにする。
     """
     if file_path.suffix.lower() not in remux_extensions:
         return
 
-    with tempfile.TemporaryDirectory(prefix=".tmp.tag_", dir=file_path.parent) as tmp_dir:
-        tmp_path = Path(tmp_dir) / file_path.name
-        tag_cmd = [
-            'ffmpeg', '-y', '-i', str(file_path),
-            '-c', 'copy', '-map', '0',
-            '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
-            '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}',
-            str(tmp_path)
-        ]
+    tmp_path = make_temp_output_path(file_path, f".tmp.tag.{file_path.stem}.")
+    tag_cmd = [
+        'ffmpeg', '-y', '-i', str(file_path),
+        '-c', 'copy', '-map', '0',
+        '-metadata', f'encoder_tool={ENCODER_TOOL_NAME}',
+        '-metadata', f'comment=tool:{ENCODER_TOOL_NAME}',
+        str(tmp_path)
+    ]
+    try:
         subprocess.run(tag_cmd, capture_output=True, check=True)
         if tmp_path.exists():
             shutil.move(str(tmp_path), str(file_path))
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 def run_encode_with_retry(
     source_file: Path,
@@ -481,6 +496,8 @@ def run_encode_with_retry(
 
         if not success:
             logger.error(f"  Failed to encode. Skipping.")
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
             summary_data.append({
                 'name': source_file.name,
                 'original_size': source_file.stat().st_size,
@@ -509,6 +526,8 @@ def run_encode_with_retry(
         
         if not src_video_streams or not tgt_video_streams:
             logger.error(f"  Video stream not found for comparison. Skipping.")
+            if in_place and encode_target_file.exists():
+                encode_target_file.unlink()
             summary_data.append({
                 'name': source_file.name,
                 'original_size': source_file.stat().st_size,
@@ -768,9 +787,6 @@ def process_file(
     # 同一ディレクトリへの出力（In-place）かどうかの判定
     in_place = source_root.resolve() == target_root.resolve()
     
-    # ffmpegの出力先ファイルパスを設定（上書きの場合は一時ファイルを使用）
-    encode_target_file = target_file.with_name(f".tmp.{target_file.name}") if in_place else target_file
-
     # 動画情報の詳細を取得
     source_info = get_video_info(source_file)
     if not source_info:
@@ -785,6 +801,9 @@ def process_file(
 
     # 音声設定の決定
     audio_codec, audio_bitrate = determine_audio_settings(source_info)
+
+    # ffmpegの出力先ファイルパスを設定（上書きの場合は安全に作成した一時ファイルを使用）
+    encode_target_file = make_temp_output_path(target_file, f".tmp.{target_file.stem}.") if in_place else target_file
 
     # エンコードとSSIM検証ループの実行
     success, attempt = run_encode_with_retry(
